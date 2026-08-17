@@ -103,6 +103,44 @@ fn collect_records(home: &Path, since_ms: Option<u128>, out: &mut Vec<YtraceReco
     }
 }
 
+/// All incidents since `since_ms` (records where payload.incident == true).
+pub fn incidents(home: &Path, since_ms: Option<u128>) -> Vec<YtraceRecord> {
+    let mut records = Vec::new();
+    collect_records(home, since_ms, &mut records);
+    records
+        .into_iter()
+        .filter(|r| r.payload.get("incident").and_then(|v| v.as_bool()).unwrap_or(false))
+        .collect()
+}
+
+/// Health summary — incident counts and hottest probes for an LLM complaint view.
+#[derive(Debug, Clone)]
+pub struct HealthSummary {
+    pub incidents: usize,
+    pub warn: usize,
+    pub error: usize,
+    pub probes: Vec<ProbeSummary>,
+}
+
+pub fn health(home: &Path, since_ms: Option<u128>) -> HealthSummary {
+    let inc = incidents(home, since_ms);
+    let warn = inc
+        .iter()
+        .filter(|r| r.payload.get("severity").and_then(|v| v.as_str()) == Some("warn"))
+        .count();
+    let error = inc
+        .iter()
+        .filter(|r| r.payload.get("severity").and_then(|v| v.as_str()) == Some("error"))
+        .count();
+    let probes = summarize(home, None, since_ms);
+    HealthSummary {
+        incidents: inc.len(),
+        warn,
+        error,
+        probes,
+    }
+}
+
 fn read_one(path: &Path, since_ms: Option<u128>, out: &mut Vec<YtraceRecord>) {
     let Ok(f) = fs::File::open(path) else {
         return;

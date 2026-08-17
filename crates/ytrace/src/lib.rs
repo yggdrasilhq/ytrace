@@ -341,6 +341,86 @@ impl Provider {
         registry::heartbeat(&self.app, &self.app_version, &self.home, None);
     }
 
+    /// Emit an incident — a ytrace record with payload.incident=true, for
+    /// governor faults, LLM complaints, and Dash notebook chapters.
+    /// Always recorded (no sampling), because loss of a fault is worse than loss of a span.
+    pub fn incident(
+        &self,
+        component: impl Into<String>,
+        category: impl Into<String>,
+        name: impl Into<String>,
+        payload: Value,
+    ) {
+        if !is_enabled() {
+            return;
+        }
+        // Ensure incident flag and complaint marker survive merge with any caller payload.
+        let mut merged = payload;
+        if let Value::Object(ref mut map) = merged {
+            map.entry("incident").or_insert(Value::Bool(true));
+            map.entry("complaint_for").or_insert(json!("llm"));
+        } else if merged.is_null() {
+            merged = json!({"incident": true, "complaint_for": "llm"});
+        } else {
+            // non-object payload: wrap
+            merged = json!({"incident": true, "complaint_for": "llm", "data": merged});
+        }
+        let rec = YtraceRecord {
+            v: YTRACE_WIRE_VERSION,
+            ts_ms: now_ms(),
+            pid: std::process::id(),
+            app: self.app.clone(),
+            app_version: self.app_version.clone(),
+            component: component.into(),
+            category: category.into(),
+            name: name.into(),
+            clock: Clock::Wall.as_str().to_string(),
+            duration_ms: None,
+            payload: merged,
+        };
+        self.append(&rec);
+    }
+
+    /// Convenience: emit a diagnosed incident via `crate::diagnosis::Incident`.
+    pub fn incident_from_diagnosis(
+        &self,
+        component: &str,
+        category: &str,
+        name: &str,
+        incident: &crate::diagnosis::Incident,
+    ) {
+        self.incident(
+            component,
+            category,
+            name,
+            crate::diagnosis::incident_payload(incident),
+        );
+    }
+
+    /// Emit a metric (point value) — gauge/counter attached as payload.metric.
+    pub fn metric(
+        &self,
+        component: impl Into<String>,
+        category: impl Into<String>,
+        name: impl Into<String>,
+        value: f64,
+        unit: &str,
+        extra: Value,
+    ) {
+        if !is_enabled() {
+            return;
+        }
+        let payload = match extra {
+            Value::Object(mut m) => {
+                m.insert("metric".to_string(), json!({"value": value, "unit": unit}));
+                Value::Object(m)
+            }
+            Value::Null => json!({"metric": {"value": value, "unit": unit}}),
+            other => json!({"metric": {"value": value, "unit": unit}, "data": other}),
+        };
+        self.event(component, category, name, payload);
+    }
+
     /// Direct append for tests / compat shim.
     pub fn append_record(&self, rec: &YtraceRecord) {
         self.append(rec);
@@ -479,3 +559,4 @@ pub mod registry;
 pub mod retention_compat;
 pub mod query;
 pub mod compat;
+pub mod diagnosis;
