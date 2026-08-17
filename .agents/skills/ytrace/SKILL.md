@@ -56,3 +56,7 @@ ytrace registry --list --stale 45s
 
 ## Verification
 `cargo -p ytrace check/test` green; `ytrace query --app yggterm` vs `yggterm-headless server perf-summary --category render` agree within 1.4%.
+
+## Notebooks — Dash is exclusively ytrace (book pages in ytop sidebar)
+
+`ytop` notebooks are the book interface for ytrace: **Top** shelf has no ytrace (host atlas), **Dash** shelf is exclusively ytrace profiling adventures. Any agent on any host composes via `ytop` skill `POST /action notebook_compose_{top,dash}` (stdin-fed, never argv-joined) → `~/.local/share/ytop/notebooks/<id>.json`. See `ytop/.agents/skills/ytop-notebooks/SKILL.md` and `ytop/src/notebook.rs` (base notebooks: `top-atlas-jojo`, `dash-angry-gui`, `dash-idle-cost`).
