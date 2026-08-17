@@ -1,0 +1,15 @@
+[package]
+authors = ["Avikalpa Kundu <avi@gour.top>"]
+name = "ytrace"
+version = "0.1.0"
+edition = "2021"
+description = "ytrace — DTrace-like probe library for ytop fleet introspection; providers emit spans/events/metrics, ytop discovers and queries them"
+license = "MIT"
+repository = "https://github.com/yggdrasilhq/ytrace"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
