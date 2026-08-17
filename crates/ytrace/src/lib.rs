@@ -426,6 +426,43 @@ impl Provider {
         self.append(rec);
     }
 
+    /// Emit a span with explicit duration (for externally-timed probes like yggterm PerfSpan).
+    /// Mirrors `Provider::span` but takes `duration_ms` caller-measured, not `Instant::now()` delta.
+    pub fn emit_span(
+        &self,
+        component: impl Into<String>,
+        category: impl Into<String>,
+        name: impl Into<String>,
+        clock: Clock,
+        duration_ms: f64,
+        payload: Value,
+    ) {
+        if !is_enabled() {
+            return;
+        }
+        let category_s = category.into();
+        let name_s = name.into();
+        if let Some(p) = self.probe_for(&category_s, &name_s) {
+            if !should_record(&p, duration_ms) {
+                return;
+            }
+        }
+        let rec = YtraceRecord {
+            v: YTRACE_WIRE_VERSION,
+            ts_ms: now_ms(),
+            pid: std::process::id(),
+            app: self.app.clone(),
+            app_version: self.app_version.clone(),
+            component: component.into(),
+            category: category_s,
+            name: name_s,
+            clock: clock.as_str().to_string(),
+            duration_ms: Some(duration_ms),
+            payload,
+        };
+        self.append(&rec);
+    }
+
     pub fn home(&self) -> &Path {
         &self.home
     }
