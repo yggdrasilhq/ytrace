@@ -76,6 +76,19 @@ pub const LOCAL_ROW_SUSTAINED_SECS: u64 = 30;
 pub const RENDER_TOTAL_CORE_THRESHOLD: f64 = 0.70;
 pub const RENDER_SUSTAINED_SECS: u64 = 30;
 
+/// A UI thread that has not proved it is running for this long is BLOCKED.
+///
+/// 200 ms is the point a human stops experiencing a keypress as immediate. It
+/// is deliberately far below the seconds-long stalls that get reported, because
+/// the useful record is the distribution of small blocks that precede a big one
+/// — a freeze bad enough to be killed by hand has almost always been preceded
+/// by a rising tail of short ones that nothing was watching.
+pub const UI_BLOCK_THRESHOLD_MS: u64 = 200;
+/// A block this long is a freeze a person notices and may act on.
+pub const UI_BLOCK_SEVERE_MS: u64 = 1_000;
+/// Blocks per minute above which the UI is not stalling but thrashing.
+pub const UI_BLOCK_DENSITY_PER_MIN: f64 = 6.0;
+
 /// Verdict for one row's resource sample.
 #[derive(Debug, Clone)]
 pub struct RowResourceSample {
@@ -85,6 +98,24 @@ pub struct RowResourceSample {
     pub core_fraction: f64,
     pub mem_kb: Option<u64>,
     pub duration_secs: u64,
+}
+
+/// One observed stall of the UI thread.
+///
+/// ⛔ This sample can only be taken by a thread that is NOT the UI thread. The
+/// probes that would normally record a freeze — the input chain, the render
+/// counter, every handler-side event — all run ON the thread that is frozen, so
+/// during a real stall they emit nothing and the incident log reads clean. A
+/// freeze measured from inside the freeze is always zero. The watchdog must
+/// therefore observe a heartbeat the UI thread stamps, from outside it.
+#[derive(Debug, Clone)]
+pub struct UiBlockSample {
+    /// How long the UI thread went without proving it was alive.
+    pub gap_ms: u64,
+    /// The last activity recorded before the gap opened — best-effort attribution.
+    pub last_activity: Option<String>,
+    /// Blocks seen per minute over the recent window, for the thrashing verdict.
+    pub blocks_per_min: Option<f64>,
 }
 
 /// Verdict for the whole render tree (gui + web).
@@ -181,11 +212,58 @@ pub fn diagnose_render(sample: &RenderSample) -> Option<Incident> {
             subject: None,
             suggested_queries: vec![
                 "ytrace query --app yggterm --category render --since 1m --json".to_string(),
-                "ytop probe --host jojo --render-top --json | head -n 40".to_string(),
+                "ytop --probe <host> --json | head -n 40".to_string(),
             ],
         });
     }
     None
+}
+
+/// Pure: one UI-thread stall -> optional incident.
+pub fn diagnose_ui_block(sample: &UiBlockSample) -> Option<Incident> {
+    if sample.gap_ms < UI_BLOCK_THRESHOLD_MS {
+        return None;
+    }
+    let severe = sample.gap_ms >= UI_BLOCK_SEVERE_MS;
+    let thrashing = sample
+        .blocks_per_min
+        .map(|d| d >= UI_BLOCK_DENSITY_PER_MIN)
+        .unwrap_or(false);
+    let attributed = sample
+        .last_activity
+        .clone()
+        .unwrap_or_else(|| "unattributed".to_string());
+    Some(Incident {
+        id: if severe { "ui_block_severe".to_string() } else { "ui_block".to_string() },
+        kind: IncidentKind::Fault,
+        severity: if severe { Severity::Error } else { Severity::Warn },
+        diagnosis: format!(
+            "UI thread stalled {} ms (last activity before the gap: {})",
+            sample.gap_ms, attributed
+        ),
+        remedy: if severe {
+            "a stall this long is a visible freeze — move the named work off the UI thread"
+                .to_string()
+        } else {
+            "short stall recorded; watch the density, a rising tail precedes a freeze".to_string()
+        },
+        observed: json!({
+            "gap_ms": sample.gap_ms,
+            "last_activity": sample.last_activity,
+            "blocks_per_min": sample.blocks_per_min,
+            "thrashing": thrashing,
+        }),
+        threshold: json!({
+            "gap_ms": UI_BLOCK_THRESHOLD_MS,
+            "severe_ms": UI_BLOCK_SEVERE_MS,
+            "density_per_min": UI_BLOCK_DENSITY_PER_MIN,
+        }),
+        subject: sample.last_activity.clone(),
+        suggested_queries: vec![
+            "ytrace incidents --app yggterm --since 1h --json".to_string(),
+            "ytrace query --app yggterm --category ui --name block --since 1h --json".to_string(),
+        ],
+    })
 }
 
 /// Render an incident into the ytrace payload shape (incident=true).
@@ -279,6 +357,50 @@ mod tests {
             duration_secs: 60,
         };
         assert!(diagnose_render(&s).is_none());
+    }
+
+    #[test]
+    fn ui_block_below_threshold_is_not_an_incident() {
+        let s = UiBlockSample { gap_ms: 120, last_activity: None, blocks_per_min: None };
+        assert!(diagnose_ui_block(&s).is_none(), "a 120 ms gap is ordinary scheduling");
+    }
+
+    #[test]
+    fn ui_block_names_what_ran_before_the_gap() {
+        let s = UiBlockSample {
+            gap_ms: 640,
+            last_activity: Some("copy_generation/title".to_string()),
+            blocks_per_min: Some(2.0),
+        };
+        let inc = diagnose_ui_block(&s).expect("640 ms is a block");
+        assert_eq!(inc.id, "ui_block");
+        assert_eq!(inc.severity, Severity::Warn);
+        assert!(
+            inc.diagnosis.contains("copy_generation/title"),
+            "a block that cannot name what ran before it is the bug this probe exists to fix"
+        );
+        assert_eq!(inc.subject.as_deref(), Some("copy_generation/title"));
+    }
+
+    #[test]
+    fn a_visible_freeze_is_an_error_not_a_warning() {
+        let s = UiBlockSample { gap_ms: 5_000, last_activity: None, blocks_per_min: None };
+        let inc = diagnose_ui_block(&s).expect("5 s is a freeze");
+        assert_eq!(inc.id, "ui_block_severe");
+        assert_eq!(inc.severity, Severity::Error);
+        assert_eq!(inc.observed["last_activity"], serde_json::Value::Null);
+        assert!(inc.diagnosis.contains("unattributed"));
+    }
+
+    #[test]
+    fn ui_block_density_marks_thrashing() {
+        let s = UiBlockSample {
+            gap_ms: 250,
+            last_activity: Some("sidebar/merge_rows".to_string()),
+            blocks_per_min: Some(UI_BLOCK_DENSITY_PER_MIN + 1.0),
+        };
+        let inc = diagnose_ui_block(&s).expect("block");
+        assert_eq!(inc.observed["thrashing"], true);
     }
 
     #[test]

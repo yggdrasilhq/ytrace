@@ -337,8 +337,16 @@ impl Provider {
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
             let _ = f.write_all(&line);
         }
-        // also best-effort registry heartbeat
-        registry::heartbeat(&self.app, &self.app_version, &self.home, None);
+        // Best-effort registry heartbeat. This is on the EMIT path, so it runs
+        // once per record; `heartbeat_with_probes` gates itself to the 15 s
+        // interval the spec documents. Before that gate existed the discovery
+        // index grew at the rate of the entire event stream.
+        let probes: Vec<String> = self
+            .probes
+            .lock()
+            .map(|m| m.keys().map(|(c, n)| format!("{c}/{n}")).collect())
+            .unwrap_or_default();
+        registry::heartbeat_with_probes(&self.app, &self.app_version, &self.home, None, &probes);
     }
 
     /// Emit an incident — a ytrace record with payload.incident=true, for

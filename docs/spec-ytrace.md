@@ -51,7 +51,7 @@ Every record is one JSON line. Common header:
   "name": "status",
   "clock": "wall",
   "duration_ms": 1.385,
-  "payload": {"rows": 54, "host": "jojo"}
+  "payload": {"rows": 54, "host": "example-host"}
 }
 ```
 
