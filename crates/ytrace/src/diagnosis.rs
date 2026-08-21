@@ -103,8 +103,24 @@ pub const HOST_TEMP_PANIC_C: f64 = 92.0;
 /// Fraction of RAM in use before memory pressure is the headline.
 pub const HOST_MEM_WARN_FRACTION: f64 = 0.85;
 pub const HOST_MEM_PANIC_FRACTION: f64 = 0.93;
-/// Swap in use that means the machine is already paging to survive.
-pub const HOST_SWAP_PANIC_GIB: f64 = 4.0;
+/// Swap in use, reported as CONTEXT and deliberately NOT an alarm trigger.
+///
+/// ⛔ **Swap-used is a LEVEL, not a pressure, and thresholding it produced an
+/// alarm that could never clear.** After a memory crunch, GiBs stay resident in
+/// swap while free RAM recovers, and nothing is obliged to reclaim them — that
+/// is the normal steady state on a client that has been busy once. So the arm
+/// was permanently true, the sustain requirement was trivially met, and
+/// `host_panic_memory` fired every 60 s reading *"32% RAM in use, 7.5 GiB
+/// swapped"* on a machine with 9 GiB free. Measured 2026-08-21: 118 of 449
+/// incidents in a two-hour window — a quarter of the stream — were this alarm,
+/// on retention that is a BYTE budget, so the noise was evicting the signal
+/// people were reading it to find.
+///
+/// ⇒ **Only RATES belong in an alarm predicate.** A level says where the system
+/// has been; a rate says what it is doing now, and only the second can clear.
+/// The number is kept because it still EXPLAINS things — a slow first touch
+/// after residency is real — and it still travels in `observed`.
+pub const HOST_SWAP_CONTEXT_GIB: f64 = 4.0;
 /// Cores our own GUI tree may burn before it is the thing making the noise.
 pub const HOST_OUR_CORES_WARN: f64 = 1.0;
 pub const HOST_OUR_CORES_PANIC: f64 = 2.0;
@@ -338,7 +354,9 @@ pub fn diagnose_host_panic(sample: &HostPanicSample) -> Option<Incident> {
     let threshold = json!({
         "temp_panic_c": HOST_TEMP_PANIC_C,
         "mem_panic_fraction": HOST_MEM_PANIC_FRACTION,
-        "swap_panic_gib": HOST_SWAP_PANIC_GIB,
+        // Named `_context_` and not `_panic_`, because a reader who sees a
+        // number under "threshold" reasonably assumes crossing it fires.
+        "swap_context_gib": HOST_SWAP_CONTEXT_GIB,
         "our_cores_panic": HOST_OUR_CORES_PANIC,
         "runtime_tmpfs_panic_bytes": HOST_RUNTIME_TMPFS_PANIC_BYTES,
         "ui_block_density_per_min": UI_BLOCK_DENSITY_PER_MIN,
@@ -358,11 +376,13 @@ pub fn diagnose_host_panic(sample: &HostPanicSample) -> Option<Incident> {
             format!("{mib} MiB held in the runtime tmpfs — that is resident memory, not disk"),
             "find the unbounded writer under $XDG_RUNTIME_DIR and give it a retention budget",
         )
+    // ⛔ RAM-in-use ONLY. Swap residency is NOT ORed in here: see
+    // [`HOST_SWAP_CONTEXT_GIB`] — it is a level that never falls on its own, so
+    // as a trigger it made an alarm that no action by the machine could clear.
     } else if sample
         .mem_used_fraction
         .map(|f| f >= HOST_MEM_PANIC_FRACTION)
         .unwrap_or(false)
-        || sample.swap_used_gib.map(|g| g >= HOST_SWAP_PANIC_GIB).unwrap_or(false)
     {
         (
             "host_panic_memory",
@@ -630,6 +650,40 @@ mod tests {
         // and the rest still travel in the payload
         assert_eq!(inc.observed["package_temp_c"], 99.0);
         assert_eq!(inc.observed["our_cores"], 3.0);
+    }
+
+    /// ⛔ THE ALARM THAT COULD NEVER CLEAR. Swap residency is a LEVEL: after one
+    /// memory crunch it stays high while RAM recovers, so an arm thresholding it
+    /// is true forever and the sustain window is met trivially. This is the
+    /// regression lock — a machine with plenty of free RAM and a swapfile full
+    /// of yesterday's residue is HEALTHY, and must be reported as such.
+    #[test]
+    fn swap_residency_alone_is_never_a_memory_panic() {
+        let s = HostPanicSample {
+            mem_used_fraction: Some(0.32),
+            swap_used_gib: Some(7.5),
+            ..hot_sample()
+        };
+        assert!(
+            diagnose_host_panic(&s).is_none(),
+            "32% RAM in use with 7.5 GiB of swap RESIDUE is not memory pressure — \
+             thresholding it fired every 60s on a machine with 9 GiB free"
+        );
+
+        // The control, so this cannot pass by disabling the arm outright:
+        // genuine RAM exhaustion is still a panic, and swap still travels as
+        // context in the payload.
+        let s = HostPanicSample {
+            mem_used_fraction: Some(HOST_MEM_PANIC_FRACTION + 0.01),
+            swap_used_gib: Some(7.5),
+            ..hot_sample()
+        };
+        let inc = diagnose_host_panic(&s).expect("real RAM exhaustion is still a panic");
+        assert_eq!(inc.id, "host_panic_memory");
+        assert_eq!(
+            inc.observed["swap_used_gib"], 7.5,
+            "swap stays in the payload — it still EXPLAINS a slow first touch"
+        );
     }
 
     #[test]
