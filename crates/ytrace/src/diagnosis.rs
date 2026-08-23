@@ -493,6 +493,142 @@ pub fn diagnose_host_panic(sample: &HostPanicSample) -> Option<Incident> {
     })
 }
 
+/// ── CLI integration gap — what CC does right and nine others get wrong ────────
+
+/// How many CLIs share the same composer marker before it is a guess, not a measurement.
+///
+/// Seven of ten descriptors carried `❯` (U+276F); `muse` measured `⟩` (U+27E9)
+/// and the probe never found the composer — `consuming_input:false` forever.
+/// A marker on ≥6 is where a guess hides among measurements.
+pub const CLI_COMPOSER_SHARED_THRESHOLD: usize = 6;
+
+/// Sample for the three 99.1 CLI integration gaps (pending-bugs.md).
+#[derive(Debug, Clone)]
+pub struct CliIntegrationSample {
+    pub total_clis: usize,
+    pub unmeasured_startup_gates: usize,
+    pub shared_composer_marker_count: usize,
+    pub reap_destroyed_briefed_row: bool,
+}
+
+/// Startup gate missing — `ygg-deliver` submits into a trust picker that eats keys.
+///
+/// Measured via `startup_gate_screen_phrases.is_empty()` per descriptor;
+/// only `codex` has a measured gate (1/10). Chain: unrecognised gate → `ready`
+/// → picker eats navigation → CLI exits → daemon relaunches → same gate → `idle`
+/// throughout (`ROW MID-RELAUNCH REPORTS idle`).
+pub fn diagnose_cli_startup_gate(sample: &CliIntegrationSample) -> Option<Incident> {
+    if sample.unmeasured_startup_gates == 0 {
+        return None;
+    }
+    Some(Incident {
+        id: "cli_startup_gate_unmeasured".to_string(),
+        kind: IncidentKind::Fault,
+        severity: Severity::Warn,
+        diagnosis: format!(
+            "{} of {} CLIs declare no startup gate — trust picker reads as typeable",
+            sample.unmeasured_startup_gates, sample.total_clis
+        ),
+        remedy: "measure via sandbox: spawn row into never-opened dir, read grid, fill startup_gate_screen_phrases".to_string(),
+        observed: json!({
+            "unmeasured_gates": sample.unmeasured_startup_gates,
+            "total_clis": sample.total_clis,
+        }),
+        threshold: json!({
+            "unmeasured_gates": 0,
+        }),
+        subject: None,
+        suggested_queries: vec![
+            "ytrace query --app yggterm --category cli --since 1h --json".to_string(),
+        ],
+    })
+}
+
+pub fn diagnose_cli_composer_marker(sample: &CliIntegrationSample) -> Option<Incident> {
+    if sample.shared_composer_marker_count < CLI_COMPOSER_SHARED_THRESHOLD {
+        return None;
+    }
+    Some(Incident {
+        id: "cli_composer_marker_unmeasured".to_string(),
+        kind: IncidentKind::Fault,
+        severity: Severity::Warn,
+        diagnosis: format!(
+            "{} CLIs share the same composer marker `❯` — at least one was a guess (muse `⟩`)",
+            sample.shared_composer_marker_count
+        ),
+        remedy: "measure each CLI's composer prompt via grid probe in sandbox; treat shared marker ≥6 as unproven".to_string(),
+        observed: json!({
+            "shared_marker_count": sample.shared_composer_marker_count,
+            "total_clis": sample.total_clis,
+        }),
+        threshold: json!({
+            "shared_threshold": CLI_COMPOSER_SHARED_THRESHOLD,
+        }),
+        subject: None,
+        suggested_queries: vec![
+            "ytrace query --app yggterm --category cli --since 1h --json".to_string(),
+        ],
+    })
+}
+
+pub fn diagnose_cli_transcript_lag(sample: &CliIntegrationSample) -> Option<Incident> {
+    if !sample.reap_destroyed_briefed_row {
+        return None;
+    }
+    Some(Incident {
+        id: "cli_transcript_lag_assumption".to_string(),
+        kind: IncidentKind::Fault,
+        severity: Severity::Error,
+        diagnosis: "reap destroyed a briefed row with 0 transcript — 0 transcript is not never briefed (codex 20 min)".to_string(),
+        remedy: "reap must not assume no-transcript = never-briefed for CLI that mints own ID; check briefed flag, not file existence".to_string(),
+        observed: json!({
+            "reap_destroyed_briefed_row": true,
+        }),
+        threshold: json!({
+            "reap_destroyed_briefed_row": false,
+        }),
+        subject: None,
+        suggested_queries: vec![
+            "ytrace query --app yggterm --category daemon --since 1h --json".to_string(),
+        ],
+    })
+}
+
+/// Daemon disconnect — the row the owner feels but ytrace never files.
+///
+/// `daemon request failed: Broken pipe` is `tracing::warn!` in `daemon.rs:980`
+/// inside the client that dies. A watcher thread that `note_activity` on
+/// `daemon request begin` and files when `Broken pipe` would have WARNed makes
+/// one `daemon/client_disconnected` per disconnect, not 30 WARNs.
+#[derive(Debug, Clone)]
+pub struct DaemonDisconnectSample {
+    pub last_activity: Option<String>,
+    pub cli_slug: Option<String>,
+}
+
+pub fn diagnose_daemon_disconnect(sample: &DaemonDisconnectSample) -> Option<Incident> {
+    Some(Incident {
+        id: "daemon_client_disconnected".to_string(),
+        kind: IncidentKind::Fault,
+        severity: Severity::Error,
+        diagnosis: format!(
+            "daemon client disconnected (Broken pipe) — last activity: {}",
+            sample.last_activity.clone().unwrap_or_else(|| "unattributed".to_string())
+        ),
+        remedy: "file outside the disconnecting process: daemon/watchdog note_activity on request begin".to_string(),
+        observed: json!({
+            "last_activity": sample.last_activity,
+            "cli_slug": sample.cli_slug,
+        }),
+        threshold: json!({}),
+        subject: sample.cli_slug.clone(),
+        suggested_queries: vec![
+            "ytrace query --app yggterm --category daemon --since 1h --json".to_string(),
+            "ytrace incidents --app yggterm --since 1h --json".to_string(),
+        ],
+    })
+}
+
 /// Render an incident into the ytrace payload shape (incident=true).
 pub fn incident_payload(incident: &Incident) -> Value {
     json!({
@@ -770,5 +906,42 @@ mod tests {
         let p = incident_payload(&inc);
         assert_eq!(p["incident"], true);
         assert_eq!(p["complaint_for"], "llm");
+    }
+
+    #[test]
+    fn cli_startup_gate_unmeasured_fires_when_nine_missing() {
+        let s = CliIntegrationSample { total_clis: 10, unmeasured_startup_gates: 9, shared_composer_marker_count: 0, reap_destroyed_briefed_row: false };
+        let inc = diagnose_cli_startup_gate(&s).expect("9 unmeasured gates is the 99.1 bug");
+        assert_eq!(inc.id, "cli_startup_gate_unmeasured");
+        assert_eq!(inc.severity, Severity::Warn);
+    }
+
+    #[test]
+    fn cli_startup_gate_silent_when_all_measured() {
+        let s = CliIntegrationSample { total_clis: 10, unmeasured_startup_gates: 0, shared_composer_marker_count: 0, reap_destroyed_briefed_row: false };
+        assert!(diagnose_cli_startup_gate(&s).is_none());
+    }
+
+    #[test]
+    fn cli_composer_marker_fires_on_shared_guess() {
+        let s = CliIntegrationSample { total_clis: 10, unmeasured_startup_gates: 0, shared_composer_marker_count: 7, reap_destroyed_briefed_row: false };
+        let inc = diagnose_cli_composer_marker(&s).expect("7 sharing ❯ is the guess");
+        assert_eq!(inc.id, "cli_composer_marker_unmeasured");
+    }
+
+    #[test]
+    fn cli_transcript_lag_fires_when_reap_ate_briefed() {
+        let s = CliIntegrationSample { total_clis: 10, unmeasured_startup_gates: 0, shared_composer_marker_count: 0, reap_destroyed_briefed_row: true };
+        let inc = diagnose_cli_transcript_lag(&s).expect("reap ate briefed row");
+        assert_eq!(inc.id, "cli_transcript_lag_assumption");
+        assert_eq!(inc.severity, Severity::Error);
+    }
+
+    #[test]
+    fn daemon_disconnect_always_files_with_attribution() {
+        let s = DaemonDisconnectSample { last_activity: Some("muse/launch".to_string()), cli_slug: Some("muse".to_string()) };
+        let inc = diagnose_daemon_disconnect(&s).expect("disconnect is always an incident");
+        assert_eq!(inc.id, "daemon_client_disconnected");
+        assert_eq!(inc.subject.as_deref(), Some("muse"));
     }
 }
