@@ -19,6 +19,10 @@ pub struct ProbeSummary {
 }
 
 /// Summarize a ytrace file (live + generations) since `since_ms`.
+///
+/// `since_ms` is an ABSOLUTE epoch-millisecond floor, not a duration. For
+/// "the last N", pass [`since_window`]; for a rate, prefer [`rate_per_min`],
+/// which cannot be handed the wrong one.
 pub fn summarize(home: &Path, category_filter: Option<&str>, since_ms: Option<u128>) -> Vec<ProbeSummary> {
     let mut records = Vec::new();
     collect_records(home, since_ms, &mut records);
@@ -90,6 +94,15 @@ pub fn tail(home: &Path, n: usize, since_ms: Option<u128>) -> Vec<YtraceRecord> 
 }
 
 fn collect_records(home: &Path, since_ms: Option<u128>, out: &mut Vec<YtraceRecord>) {
+    // `since_ms` is an absolute epoch. A duration here compiles and silently
+    // widens the query to all of history, which reads as a plausible number
+    // rather than an error — see the note above `EPOCH_FLOOR_MS`.
+    debug_assert!(
+        !since_ms.is_some_and(looks_like_duration),
+        "ytrace::query: since_ms={:?} is duration-shaped, not an epoch. \
+         Use query::since_window(Duration) — or rate_per_min() if you want a rate.",
+        since_ms
+    );
     let live = home.join("ytrace.jsonl");
     read_one(&live, since_ms, out);
     // generations
@@ -103,7 +116,8 @@ fn collect_records(home: &Path, since_ms: Option<u128>, out: &mut Vec<YtraceReco
     }
 }
 
-/// All incidents since `since_ms` (records where payload.incident == true).
+/// All incidents since `since_ms` — an ABSOLUTE epoch-ms floor, see [`since_window`].
+/// (Records where payload.incident == true.)
 pub fn incidents(home: &Path, since_ms: Option<u128>) -> Vec<YtraceRecord> {
     let mut records = Vec::new();
     collect_records(home, since_ms, &mut records);
@@ -164,5 +178,155 @@ fn read_one(path: &Path, since_ms: Option<u128>, out: &mut Vec<YtraceRecord>) {
                 out.push(r);
             }
         }
+    }
+}
+
+// ── windows, rates, and the difference between them ─────────────────────────
+//
+// Every `since_ms` in this module is an ABSOLUTE epoch-millisecond floor, not a
+// duration. The two are the same Rust type and read the same at a call site, so
+// handing over a duration compiles, runs, and silently widens the query to all
+// of recorded history — `Some(300_000)` is not "the last five minutes", it is
+// "since 1970-01-01T00:05:00Z".
+//
+// That mistake does not fail loudly. It produces a plausible number that is a
+// LIFETIME TALLY divided by whatever the caller assumed the window was, so it
+// climbs with process age, resets on restart, and falls when retention prunes
+// the log — three movements that have nothing to do with the thing measured.
+// A threshold placed on it arms once and never disarms.
+//
+// `since_window` and `rate_per_min` exist so the correct call is the short one.
+
+/// Epoch-ms below which a value cannot be a real timestamp (2001-09-09).
+///
+/// A duration would have to exceed 31 years to reach this, so anything under it
+/// arriving in a `since_ms` position is a duration handed over by mistake.
+pub const EPOCH_FLOOR_MS: u128 = 1_000_000_000_000;
+
+/// True when a `since_ms` argument is duration-shaped rather than a timestamp.
+pub fn looks_like_duration(since_ms: u128) -> bool {
+    since_ms < EPOCH_FLOOR_MS
+}
+
+/// The absolute epoch-ms floor for "the last `window`" — the conversion every
+/// caller of [`summarize`], [`tail`], [`incidents`] and [`health`] must perform.
+pub fn since_window(window: std::time::Duration) -> u128 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    now.saturating_sub(window.as_millis())
+}
+
+/// A rate, carrying the window it was measured over and the sample it came from.
+///
+/// Returned instead of a bare `f64` so a consumer cannot render the number
+/// without the two facts needed to judge it: how wide the window was, and how
+/// many observations landed in it. A rate over one observation is noise, and a
+/// rate whose window is the whole log is a tally.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rate {
+    /// Observations that fell inside the window.
+    pub count: u64,
+    /// The window actually measured over.
+    pub window: std::time::Duration,
+    /// Observations per minute.
+    pub per_min: f64,
+}
+
+impl Rate {
+    /// Human form that keeps the window attached to the number.
+    pub fn describe(&self) -> String {
+        format!(
+            "{:.1}/min ({} over {}s)",
+            self.per_min,
+            self.count,
+            self.window.as_secs()
+        )
+    }
+}
+
+/// Observations per minute for one probe over a real, bounded window.
+///
+/// Returns `Some(Rate { count: 0, .. })` when the probe exists in this home but
+/// was quiet — which is a measured zero. Returns `None` only when the window is
+/// degenerate, so a caller can tell "quiet" from "unmeasurable" rather than
+/// collapsing both into an all-clear.
+pub fn rate_per_min(
+    home: &Path,
+    category: &str,
+    name: &str,
+    window: std::time::Duration,
+) -> Option<Rate> {
+    let minutes = window.as_secs_f64() / 60.0;
+    if minutes <= 0.0 {
+        return None;
+    }
+    let summaries = summarize(home, Some(category), Some(since_window(window)));
+    let count = summaries
+        .iter()
+        .find(|s| s.name == name)
+        .map(|s| s.count)
+        .unwrap_or(0);
+    Some(Rate {
+        count,
+        window,
+        per_min: count as f64 / minutes,
+    })
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn a_duration_in_a_since_slot_is_recognised() {
+        // The exact mistake: five minutes passed where an epoch was expected.
+        assert!(looks_like_duration(5 * 60_000));
+        assert!(looks_like_duration(Duration::from_secs(86_400).as_millis()));
+        // Even an implausibly long duration stays under the floor.
+        assert!(looks_like_duration(Duration::from_secs(86_400 * 365).as_millis()));
+    }
+
+    #[test]
+    fn a_real_timestamp_is_not_mistaken_for_one() {
+        let now = since_window(Duration::ZERO);
+        assert!(!looks_like_duration(now));
+        assert!(!looks_like_duration(now - Duration::from_secs(86_400).as_millis()));
+    }
+
+    #[test]
+    fn since_window_walks_backwards_from_now() {
+        let now = since_window(Duration::ZERO);
+        let five_min = since_window(Duration::from_secs(300));
+        let delta = now.saturating_sub(five_min);
+        // 300_000 ms back, allowing for the clock moving between the two calls.
+        assert!((299_000..=301_000).contains(&delta), "delta was {delta}");
+    }
+
+    #[test]
+    fn a_rate_keeps_its_window_and_count() {
+        let r = Rate {
+            count: 30,
+            window: Duration::from_secs(300),
+            per_min: 6.0,
+        };
+        assert_eq!(r.describe(), "6.0/min (30 over 300s)");
+    }
+
+    #[test]
+    fn a_degenerate_window_is_unmeasurable_not_zero() {
+        let home = std::path::Path::new("/nonexistent-ytrace-home");
+        assert!(rate_per_min(home, "ui", "block", Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn an_absent_probe_reads_as_a_measured_zero() {
+        let home = std::path::Path::new("/nonexistent-ytrace-home");
+        let r = rate_per_min(home, "ui", "block", Duration::from_secs(300)).unwrap();
+        assert_eq!(r.count, 0);
+        assert_eq!(r.per_min, 0.0);
+        assert_eq!(r.window, Duration::from_secs(300));
     }
 }
