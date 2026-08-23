@@ -98,9 +98,41 @@ pub struct Retention {
 
 pub const DEFAULT_RETENTION: Retention = Retention {
     live_max_bytes: 8 * 1024 * 1024,
-    generations_max_bytes: 64 * 1024 * 1024,
+    generations_max_bytes: 1024 * 1024 * 1024,
     max_age_ms: DEFAULT_MAX_AGE_MS,
 };
+
+fn is_dev_mode() -> bool {
+    if std::env::var("YGGTERM_DEV")
+        .map(|v| v == "1" || v.to_ascii_lowercase() == "true")
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if let Some(home) = dirs::home_dir() {
+        let path = home.join(".yggterm/config/dev-mode");
+        if let Ok(c) = std::fs::read_to_string(path) {
+            let trimmed = c.trim().to_ascii_lowercase();
+            if trimmed == "1" || trimmed == "true" || trimmed == "yes" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn default_retention() -> Retention {
+    let generations_max_bytes = if is_dev_mode() {
+        10 * 1024 * 1024 * 1024
+    } else {
+        1024 * 1024 * 1024
+    };
+    Retention {
+        live_max_bytes: 8 * 1024 * 1024,
+        generations_max_bytes,
+        max_age_ms: DEFAULT_MAX_AGE_MS,
+    }
+}
 
 fn generation_path(path: &Path, ts_ms: u128) -> PathBuf {
     let stem = path
@@ -238,7 +270,7 @@ impl Provider {
             app_version: app_version.into(),
             home,
             probes: Mutex::new(HashMap::new()),
-            retention: DEFAULT_RETENTION,
+            retention: default_retention(),
         }
     }
 
