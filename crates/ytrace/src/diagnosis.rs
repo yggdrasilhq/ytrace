@@ -125,7 +125,36 @@ pub const HOST_SWAP_CONTEXT_GIB: f64 = 4.0;
 pub const HOST_OUR_CORES_WARN: f64 = 1.0;
 pub const HOST_OUR_CORES_PANIC: f64 = 2.0;
 /// Bytes of `$XDG_RUNTIME_DIR` — a tmpfs, therefore RAM — we may hold.
+///
+/// 128 MiB in prod, 4 GiB in dev (2026-08-23): `YGGTERM_DEV=1` or
+/// `~/.yggterm/config/dev-mode` contains `1` means the fleet dev hosts run
+/// `yggterm-uglass` sway isolation on tmpfs (`/run/user/3001`), which
+/// legitimately holds `mesa_shader_cache`/`uv`/`WPE` caches. The 128M threshold
+/// was the unbounded-npm writer (1.5G x3 → 6.7G tmpfs); after deduplicating
+/// uglass `npm` via symlink to `/home/pi/.yggterm/npm` (-4.3G → 2.4G), the
+/// residual 2.x GiB is sway/WPE caches, not an yggterm leak. Dev threshold
+/// 4G still catches the leak (1.5G x3 would be 4.5G) without firing on warm
+/// caches.
 pub const HOST_RUNTIME_TMPFS_PANIC_BYTES: u64 = 128 * 1024 * 1024;
+pub const HOST_RUNTIME_TMPFS_PANIC_BYTES_DEV: u64 = 4 * 1024 * 1024 * 1024;
+
+fn host_runtime_tmpfs_panic_bytes() -> u64 {
+    if std::env::var("YGGTERM_DEV")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return HOST_RUNTIME_TMPFS_PANIC_BYTES_DEV;
+    }
+    if let Some(home) = dirs::home_dir() {
+        if let Ok(c) = std::fs::read_to_string(home.join(".yggterm/config/dev-mode")) {
+            let t = c.trim().to_ascii_lowercase();
+            if t == "1" || t == "true" || t == "yes" {
+                return HOST_RUNTIME_TMPFS_PANIC_BYTES_DEV;
+            }
+        }
+    }
+    HOST_RUNTIME_TMPFS_PANIC_BYTES
+}
 /// How long a condition must hold before it is a panic rather than a spike.
 pub const HOST_PANIC_SUSTAINED_SECS: u64 = 60;
 
@@ -358,7 +387,7 @@ pub fn diagnose_host_panic(sample: &HostPanicSample) -> Option<Incident> {
         // number under "threshold" reasonably assumes crossing it fires.
         "swap_context_gib": HOST_SWAP_CONTEXT_GIB,
         "our_cores_panic": HOST_OUR_CORES_PANIC,
-        "runtime_tmpfs_panic_bytes": HOST_RUNTIME_TMPFS_PANIC_BYTES,
+        "runtime_tmpfs_panic_bytes": host_runtime_tmpfs_panic_bytes(),
         "ui_block_density_per_min": UI_BLOCK_DENSITY_PER_MIN,
         "sustained_secs": HOST_PANIC_SUSTAINED_SECS,
     });
@@ -366,7 +395,7 @@ pub fn diagnose_host_panic(sample: &HostPanicSample) -> Option<Incident> {
     // MEMORY FIRST.
     let (id, severity, headline, remedy) = if sample
         .runtime_tmpfs_bytes
-        .map(|b| b >= HOST_RUNTIME_TMPFS_PANIC_BYTES)
+        .map(|b| b >= host_runtime_tmpfs_panic_bytes())
         .unwrap_or(false)
     {
         let mib = sample.runtime_tmpfs_bytes.unwrap_or(0) / (1024 * 1024);
