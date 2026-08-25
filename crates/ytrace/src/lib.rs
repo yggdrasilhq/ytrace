@@ -2,10 +2,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // ── wire ────────────────────────────────────────────────────────────────────
 
@@ -249,6 +249,7 @@ pub struct Provider {
     pub home: PathBuf,
     probes: Mutex<HashMap<(String, String), Probe>>,
     retention: Retention,
+    writer: Mutex<Option<(File, u64)>>,
 }
 
 impl Provider {
@@ -271,6 +272,7 @@ impl Provider {
             home,
             probes: Mutex::new(HashMap::new()),
             retention: default_retention(),
+            writer: Mutex::new(None),
         }
     }
 
@@ -363,16 +365,32 @@ impl Provider {
             return;
         };
         line.push(b'\n');
+        let line_len = line.len() as u64;
         let path = self.home.join("ytrace.jsonl");
-        let _ = fs::create_dir_all(&self.home);
-        rotate_if_needed(&path, self.retention, line.len() as u64);
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = f.write_all(&line);
+
+        if let Ok(mut writer_guard) = self.writer.lock() {
+            let needs_rotation = match writer_guard.as_ref() {
+                Some((_, current_len)) => current_len.saturating_add(line_len) > self.retention.live_max_bytes,
+                None => true,
+            };
+            if needs_rotation {
+                *writer_guard = None;
+                let _ = fs::create_dir_all(&self.home);
+                rotate_if_needed(&path, self.retention, line_len);
+                let initial_len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                if let Ok(file) = OpenOptions::new().create(true).append(true).open(&path) {
+                    *writer_guard = Some((file, initial_len));
+                }
+            }
+            if let Some((file, current_len)) = writer_guard.as_mut() {
+                if file.write_all(&line).is_ok() {
+                    *current_len = current_len.saturating_add(line_len);
+                }
+            }
         }
-        // Best-effort registry heartbeat. This is on the EMIT path, so it runs
-        // once per record; `heartbeat_with_probes` gates itself to the 15 s
-        // interval the spec documents. Before that gate existed the discovery
-        // index grew at the rate of the entire event stream.
+
+        // Best-effort registry heartbeat. `heartbeat_with_probes` gates itself to the 15 s
+        // interval the spec documents.
         let probes: Vec<String> = self
             .probes
             .lock()

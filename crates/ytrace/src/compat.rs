@@ -1,7 +1,7 @@
 //! Compat shim: read yggterm's existing `perf-telemetry.jsonl` / `event-trace.jsonl`
 //! as if they were ytrace records, so old and new readers share bytes during migration.
 
-use crate::{Clock, YtraceRecord, YTRACE_WIRE_VERSION};
+use crate::{YtraceRecord, YTRACE_WIRE_VERSION};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 

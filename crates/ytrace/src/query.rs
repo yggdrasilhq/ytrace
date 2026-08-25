@@ -1,21 +1,34 @@
 use crate::YtraceRecord;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 /// Summary of one probe kind, like `server perf-summary`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeSummary {
     pub app: String,
     pub category: String,
     pub name: String,
     pub clock: String,
+    pub is_span: bool,
     pub count: u64,
     pub total_ms: f64,
     pub p50_ms: f64,
     pub p95_ms: f64,
     pub max_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeseriesBucket {
+    pub bucket_start_ms: u128,
+    pub bucket_end_ms: u128,
+    pub count: u64,
+    pub span_count: u64,
+    pub total_duration_ms: f64,
+    pub p95_ms: f64,
+    pub incident_count: u64,
 }
 
 /// Summarize a ytrace file (live + generations) since `since_ms`.
@@ -26,34 +39,42 @@ pub struct ProbeSummary {
 pub fn summarize(home: &Path, category_filter: Option<&str>, since_ms: Option<u128>) -> Vec<ProbeSummary> {
     let mut records = Vec::new();
     collect_records(home, since_ms, &mut records);
-    let mut by_probe: std::collections::BTreeMap<(String, String, String), Vec<f64>> = std::collections::BTreeMap::new();
+    let mut by_probe_durs: std::collections::BTreeMap<(String, String, String), Vec<f64>> = std::collections::BTreeMap::new();
+    let mut by_probe_counts: std::collections::BTreeMap<(String, String, String), u64> = std::collections::BTreeMap::new();
     let mut app_by_probe: std::collections::HashMap<(String, String, String), String> = std::collections::HashMap::new();
-    let mut clock_by_probe: std::collections::HashMap<(String, String, String), String> = std::collections::HashMap::new();
+
     for r in records {
         if let Some(cat) = category_filter {
             if r.category != cat {
                 continue;
             }
         }
-        if r.duration_ms.is_none() {
-            continue;
+        let clock = if r.duration_ms.is_some() {
+            r.clock.clone()
+        } else {
+            "point".to_string()
+        };
+        let key = (r.category.clone(), r.name.clone(), clock);
+        *by_probe_counts.entry(key.clone()).or_default() += 1;
+        if let Some(dur) = r.duration_ms {
+            by_probe_durs.entry(key.clone()).or_default().push(dur);
         }
-        let key = (r.category.clone(), r.name.clone(), r.clock.clone());
-        by_probe
-            .entry(key.clone())
-            .or_default()
-            .push(r.duration_ms.unwrap());
-        app_by_probe.entry(key.clone()).or_insert(r.app.clone());
-        clock_by_probe.entry(key.clone()).or_insert(r.clock.clone());
+        app_by_probe.entry(key).or_insert(r.app.clone());
     }
+
     let mut out = Vec::new();
-    for ((category, name, clock), mut durs) in by_probe {
-        durs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let count = durs.len() as u64;
-        let total_ms: f64 = durs.iter().sum();
-        let p50_ms = percentile(&durs, 0.5);
-        let p95_ms = percentile(&durs, 0.95);
-        let max_ms = durs.last().copied().unwrap_or(0.0);
+    for ((category, name, clock), count) in by_probe_counts {
+        let is_span = by_probe_durs.contains_key(&(category.clone(), name.clone(), clock.clone()));
+        let (total_ms, p50_ms, p95_ms, max_ms) = if let Some(mut durs) = by_probe_durs.remove(&(category.clone(), name.clone(), clock.clone())) {
+            durs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let tot: f64 = durs.iter().sum();
+            let p50 = percentile(&durs, 0.5);
+            let p95 = percentile(&durs, 0.95);
+            let max = durs.last().copied().unwrap_or(0.0);
+            (tot, p50, p95, max)
+        } else {
+            (0.0, 0.0, 0.0, 0.0)
+        };
         let app = app_by_probe
             .get(&(category.clone(), name.clone(), clock.clone()))
             .cloned()
@@ -63,6 +84,7 @@ pub fn summarize(home: &Path, category_filter: Option<&str>, since_ms: Option<u1
             category,
             name,
             clock,
+            is_span,
             count,
             total_ms,
             p50_ms,
@@ -70,7 +92,83 @@ pub fn summarize(home: &Path, category_filter: Option<&str>, since_ms: Option<u1
             max_ms,
         });
     }
-    out.sort_by(|a, b| b.total_ms.partial_cmp(&a.total_ms).unwrap());
+    out.sort_by(|a, b| {
+        b.total_ms
+            .partial_cmp(&a.total_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.count.cmp(&a.count))
+    });
+    out
+}
+
+/// Produce folded stacks for flamegraphs: `app;component;category;name <sample_value>`
+pub fn flamegraph_folded(home: &Path, since_ms: Option<u128>, by_wall_time: bool) -> Vec<(String, u64)> {
+    let mut records = Vec::new();
+    collect_records(home, since_ms, &mut records);
+    let mut stacks: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for r in records {
+        let stack = format!("{app};{comp};{cat};{name}",
+            app = if r.app.is_empty() { "yggterm" } else { &r.app },
+            comp = if r.component.is_empty() { "core" } else { &r.component },
+            cat = r.category,
+            name = r.name
+        );
+        let val = if by_wall_time {
+            r.duration_ms.map(|d| (d.max(0.1) * 1000.0) as u64).unwrap_or(100)
+        } else {
+            1
+        };
+        *stacks.entry(stack).or_default() += val;
+    }
+    let mut out: Vec<_> = stacks.into_iter().collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1));
+    out
+}
+
+/// Generate bucketed timeseries for telemetry trends
+pub fn timeseries(home: &Path, bucket_ms: u128, since_ms: Option<u128>) -> Vec<TimeseriesBucket> {
+    let mut records = Vec::new();
+    collect_records(home, since_ms, &mut records);
+    records.sort_by_key(|r| r.ts_ms);
+
+    if records.is_empty() {
+        return Vec::new();
+    }
+    let bucket_ms = bucket_ms.max(1000);
+    let first_ts = records.first().map(|r| r.ts_ms).unwrap_or(0);
+    let last_ts = records.last().map(|r| r.ts_ms).unwrap_or(0);
+
+    let mut buckets: std::collections::BTreeMap<u128, Vec<&YtraceRecord>> = std::collections::BTreeMap::new();
+    let mut cur = (first_ts / bucket_ms) * bucket_ms;
+    while cur <= last_ts {
+        buckets.insert(cur, Vec::new());
+        cur += bucket_ms;
+    }
+
+    for r in &records {
+        let b_start = (r.ts_ms / bucket_ms) * bucket_ms;
+        buckets.entry(b_start).or_default().push(r);
+    }
+
+    let mut out = Vec::new();
+    for (start, recs) in buckets {
+        let count = recs.len() as u64;
+        let mut durs: Vec<f64> = recs.iter().filter_map(|r| r.duration_ms).collect();
+        durs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let span_count = durs.len() as u64;
+        let total_duration_ms: f64 = durs.iter().sum();
+        let p95_ms = percentile(&durs, 0.95);
+        let incident_count = recs.iter().filter(|r| r.payload.get("incident").and_then(|v| v.as_bool()).unwrap_or(false)).count() as u64;
+        out.push(TimeseriesBucket {
+            bucket_start_ms: start,
+            bucket_end_ms: start + bucket_ms,
+            count,
+            span_count,
+            total_duration_ms,
+            p95_ms,
+            incident_count,
+        });
+    }
     out
 }
 

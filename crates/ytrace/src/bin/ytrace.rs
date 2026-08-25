@@ -59,6 +59,40 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Top-table view of system and application probes with sorted attribution.
+    Top {
+        #[arg(long, default_value = "yggterm")]
+        app: String,
+        #[arg(long)]
+        category: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long, default_value_t = 30)]
+        top: usize,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Flamegraph folded-stack format for flamegraph viewers.
+    Flame {
+        #[arg(long, default_value = "yggterm")]
+        app: String,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long, default_value_t = false)]
+        by_count: bool,
+    },
+    /// Bucketed timeseries trend analysis.
+    Timeseries {
+        #[arg(long, default_value = "yggterm")]
+        app: String,
+        /// Bucket size, e.g. 1s, 5s, 1m
+        #[arg(long, default_value = "5s")]
+        bucket: String,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Discovery registry.
     Registry {
         #[arg(long, default_value_t = false)]
@@ -137,6 +171,10 @@ fn resolve_home(app: &str) -> PathBuf {
 }
 
 fn main() -> Result<()> {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     match cli.command {
         Commands::Query {
@@ -196,7 +234,7 @@ fn main() -> Result<()> {
             let since_ms = since.as_deref().and_then(parse_since);
             // --lines N dominates; default 20
             let n = lines.unwrap_or(20);
-            let mut recs = if let Some(cat) = category {
+            let recs = if let Some(cat) = category {
                 let all = ytrace::query::tail(&home, 100_000, since_ms);
                 let mut filtered: Vec<_> = all.into_iter().filter(|r| r.category == cat).collect();
                 filtered.sort_by_key(|r| r.ts_ms);
@@ -247,7 +285,7 @@ fn main() -> Result<()> {
                     "error": h.error,
                     "probes": h.probes.iter().map(|s| serde_json::json!({
                         "app": s.app, "category": s.category, "name": s.name,
-                        "clock": s.clock, "count": s.count, "total_ms": s.total_ms,
+                        "clock": s.clock, "is_span": s.is_span, "count": s.count, "total_ms": s.total_ms,
                         "p50_ms": s.p50_ms, "p95_ms": s.p95_ms, "max_ms": s.max_ms
                     })).collect::<Vec<_>>()
                 });
@@ -256,6 +294,88 @@ fn main() -> Result<()> {
                 println!("incidents: {} warn:{} error:{} probes:{}", h.incidents, h.warn, h.error, h.probes.len());
                 for s in h.probes.iter().take(10) {
                     println!("  {} {} {} {} count={} total={:.1} p50={:.1}", s.app, s.category, s.name, s.clock, s.count, s.total_ms, s.p50_ms);
+                }
+            }
+        }
+        Commands::Top {
+            app,
+            category,
+            since,
+            top,
+            json,
+        } => {
+            let home = resolve_home(&app);
+            let since_ms = since.as_deref().and_then(parse_since);
+            let mut sums = ytrace::query::summarize(&home, category.as_deref(), since_ms);
+            sums.truncate(top);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&sums)?);
+            } else {
+                println!(
+                    "┌────────────────────────────────┬──────────────┬────────┬──────────┬──────────┬──────────┬──────────┐"
+                );
+                println!(
+                    "│ {:<30} │ {:<12} │ {:<6} │ {:>8} │ {:>8} │ {:>8} │ {:>8} │",
+                    "Probe (category/name)", "App", "Clock", "Count", "Total ms", "p95 ms", "Max ms"
+                );
+                println!(
+                    "├────────────────────────────────┼──────────────┼────────┼──────────┼──────────┼──────────┼──────────┤"
+                );
+                for s in sums {
+                    let probe_name = format!("{}/{}", s.category, s.name);
+                    println!(
+                        "│ {:<30} │ {:<12} │ {:<6} │ {:>8} │ {:>8.1} │ {:>8.1} │ {:>8.1} │",
+                        if probe_name.len() > 30 { &probe_name[..30] } else { &probe_name },
+                        if s.app.len() > 12 { &s.app[..12] } else { &s.app },
+                        s.clock,
+                        s.count,
+                        s.total_ms,
+                        s.p95_ms,
+                        s.max_ms
+                    );
+                }
+                println!(
+                    "└────────────────────────────────┴──────────────┴────────┴──────────┴──────────┴──────────┴──────────┘"
+                );
+            }
+        }
+        Commands::Flame {
+            app,
+            since,
+            by_count,
+        } => {
+            let home = resolve_home(&app);
+            let since_ms = since.as_deref().and_then(parse_since);
+            let stacks = ytrace::query::flamegraph_folded(&home, since_ms, !by_count);
+            for (stack, val) in stacks {
+                println!("{stack} {val}");
+            }
+        }
+        Commands::Timeseries {
+            app,
+            bucket,
+            since,
+            json,
+        } => {
+            let home = resolve_home(&app);
+            let since_ms = since.as_deref().and_then(parse_since);
+            let bucket_ms = parse_stale(&bucket);
+            let series = ytrace::query::timeseries(&home, bucket_ms, since_ms);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&series)?);
+            } else {
+                println!(
+                    "{:<24} {:>8} {:>8} {:>10} {:>8} {:>10}",
+                    "Bucket Time", "Events", "Spans", "Total ms", "p95 ms", "Incidents"
+                );
+                for b in series {
+                    let dt = chrono::DateTime::from_timestamp_millis(b.bucket_start_ms as i64)
+                        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| b.bucket_start_ms.to_string());
+                    println!(
+                        "{:<24} {:>8} {:>8} {:>10.1} {:>8.1} {:>10}",
+                        dt, b.count, b.span_count, b.total_duration_ms, b.p95_ms, b.incident_count
+                    );
                 }
             }
         }
