@@ -1,7 +1,7 @@
 [package]
 authors = ["Avikalpa Kundu <avi@gour.top>"]
 name = "ytrace"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "ytrace — DTrace-like probe library for ytop fleet introspection; providers emit spans/events/metrics, ytop discovers and queries them"
 license = "MIT"

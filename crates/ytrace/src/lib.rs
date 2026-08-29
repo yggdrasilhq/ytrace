@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // ── wire ────────────────────────────────────────────────────────────────────
@@ -202,19 +202,6 @@ fn prune_generations(path: &Path, retention: Retention, now_ms: u128) {
     }
 }
 
-fn rotate_if_needed(path: &Path, retention: Retention, incoming: u64) {
-    let Ok(meta) = fs::metadata(path) else {
-        return;
-    };
-    if meta.len().saturating_add(incoming) <= retention.live_max_bytes {
-        return;
-    }
-    let ts = now_ms();
-    let gen = generation_path(path, ts);
-    let _ = fs::rename(path, &gen);
-    prune_generations(path, retention, ts);
-}
-
 // ── provider ────────────────────────────────────────────────────────────────
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -249,7 +236,21 @@ pub struct Provider {
     pub home: PathBuf,
     probes: Mutex<HashMap<(String, String), Probe>>,
     retention: Retention,
-    writer: Mutex<Option<(File, u64)>>,
+    /// Held file handle — the emit path must not pay open/close per record.
+    out: Mutex<OutFile>,
+    /// The script engine. Always present; `has_scripts()` is the hot-path gate.
+    control: Arc<control::Control>,
+    /// Advertised in the registry when the control socket bound successfully.
+    socket: Option<PathBuf>,
+}
+
+/// Byte interval between rotation checks on the held handle. The old path paid
+/// a `stat` per record; the file's size only needs sampling at this cadence.
+const ROTATION_CHECK_BYTES: u64 = 64 * 1024;
+
+struct OutFile {
+    file: Option<File>,
+    written_since_check: u64,
 }
 
 impl Provider {
@@ -266,14 +267,35 @@ impl Provider {
     ) -> Self {
         let home = home.into();
         let _ = fs::create_dir_all(&home);
+        let app = app.into();
+        // Script engine + best-effort control socket. A failed bind (stale
+        // socket, pid collision) costs nothing: emission is unaffected.
+        let control = Arc::new(control::Control::new(&app));
+        let socket = control::control_dir()
+            .and_then(|dir| control::serve(Arc::clone(&control), &dir, &app, std::process::id()));
         Self {
-            app: app.into(),
+            app,
             app_version: app_version.into(),
             home,
             probes: Mutex::new(HashMap::new()),
             retention: default_retention(),
-            writer: Mutex::new(None),
+            out: Mutex::new(OutFile {
+                file: None,
+                written_since_check: 0,
+            }),
+            control,
+            socket,
         }
+    }
+
+    /// The script engine — attach/drain from tests or in-process callers.
+    pub fn control(&self) -> &Arc<control::Control> {
+        &self.control
+    }
+
+    /// The control socket path, when the server bound (advertised in registry).
+    pub fn socket_path(&self) -> Option<&Path> {
+        self.socket.as_deref()
     }
 
     pub fn with_retention(mut self, retention: Retention) -> Self {
@@ -328,6 +350,36 @@ impl Provider {
         })
     }
 
+    /// The script-plane hook: every probe firing reaches attached scripts,
+    /// unsampled — sampling is a FILE-stream policy, and a `@quantize` that saw
+    /// only 1:50 of fast frames would be a lying instrument. Runs before the
+    /// sampling gate; no allocation unless a predicate matched.
+    fn scripts_eval(
+        &self,
+        component: &str,
+        category: &str,
+        name: &str,
+        clock: &str,
+        duration_ms: Option<f64>,
+        payload: &Value,
+        ts_ms: u128,
+    ) {
+        if self.control.has_scripts() {
+            let r = script::RecRef {
+                ts_ms,
+                pid: std::process::id(),
+                app: &self.app,
+                app_version: &self.app_version,
+                component,
+                category,
+                name,
+                clock,
+                duration_ms,
+            };
+            self.control.eval(category, name, &r, payload);
+        }
+    }
+
     pub fn event(
         &self,
         component: impl Into<String>,
@@ -338,15 +390,26 @@ impl Provider {
         if !is_enabled() {
             return;
         }
+        let component = component.into();
         let category = category.into();
         let name = name.into();
+        let ts_ms = now_ms();
+        self.scripts_eval(
+            &component,
+            &category,
+            &name,
+            Clock::Wall.as_str(),
+            None,
+            &payload,
+            ts_ms,
+        );
         let rec = YtraceRecord {
             v: YTRACE_WIRE_VERSION,
-            ts_ms: now_ms(),
+            ts_ms,
             pid: std::process::id(),
             app: self.app.clone(),
             app_version: self.app_version.clone(),
-            component: component.into(),
+            component,
             category,
             name,
             clock: Clock::Wall.as_str().to_string(),
@@ -365,38 +428,82 @@ impl Provider {
             return;
         };
         line.push(b'\n');
-        let line_len = line.len() as u64;
-        let path = self.home.join("ytrace.jsonl");
-
-        if let Ok(mut writer_guard) = self.writer.lock() {
-            let needs_rotation = match writer_guard.as_ref() {
-                Some((_, current_len)) => current_len.saturating_add(line_len) > self.retention.live_max_bytes,
-                None => true,
-            };
-            if needs_rotation {
-                *writer_guard = None;
-                let _ = fs::create_dir_all(&self.home);
-                rotate_if_needed(&path, self.retention, line_len);
-                let initial_len = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                if let Ok(file) = OpenOptions::new().create(true).append(true).open(&path) {
-                    *writer_guard = Some((file, initial_len));
-                }
-            }
-            if let Some((file, current_len)) = writer_guard.as_mut() {
-                if file.write_all(&line).is_ok() {
-                    *current_len = current_len.saturating_add(line_len);
-                }
+        let len = line.len() as u64;
+        let mut out = self.out.lock().unwrap();
+        if out.file.is_none() {
+            let _ = fs::create_dir_all(&self.home);
+            out.file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.home.join("ytrace.jsonl"))
+                .ok();
+            out.written_since_check = 0;
+        }
+        if let Some(f) = out.file.as_mut() {
+            let _ = f.write_all(&line);
+            out.written_since_check += len;
+            if out.written_since_check >= ROTATION_CHECK_BYTES {
+                out.written_since_check = 0;
+                self.rotation_check(&mut out.file, len);
             }
         }
-
-        // Best-effort registry heartbeat. `heartbeat_with_probes` gates itself to the 15 s
-        // interval the spec documents.
+        drop(out);
+        // Best-effort registry heartbeat. This is on the EMIT path, so it runs
+        // once per record; the 15 s interval gate keeps the discovery index
+        // from growing at the rate of the event stream.
         let probes: Vec<String> = self
             .probes
             .lock()
             .map(|m| m.keys().map(|(c, n)| format!("{c}/{n}")).collect())
             .unwrap_or_default();
-        registry::heartbeat_with_probes(&self.app, &self.app_version, &self.home, None, &probes);
+        registry::heartbeat_with_probes(
+            &self.app,
+            &self.app_version,
+            &self.home,
+            self.socket.as_deref(),
+            &probes,
+        );
+    }
+
+    /// Rotation + liveness check on the held handle, run every
+    /// `ROTATION_CHECK_BYTES` instead of per record. Inode-aware: if another
+    /// process rotated under us, our handle points at a renamed generation —
+    /// detect by (dev, ino) identity and reopen the live path, so records keep
+    /// landing where readers look.
+    fn rotation_check(&self, file: &mut Option<File>, incoming: u64) {
+        use std::os::unix::fs::MetadataExt;
+        let path = self.home.join("ytrace.jsonl");
+        let ours_id = file
+            .as_ref()
+            .and_then(|f| f.metadata().ok())
+            .map(|m| (m.dev(), m.ino()));
+        let live = fs::metadata(&path).ok();
+        let live_id = live.as_ref().map(|m| (m.dev(), m.ino()));
+        match (&ours_id, &live_id) {
+            (Some(a), Some(b)) if a != b => {
+                // rotated elsewhere — adopt the live file
+                *file = OpenOptions::new().create(true).append(true).open(&path).ok();
+                return;
+            }
+            (Some(_), None) => {
+                // live file vanished (manual prune) — recreate by reopening
+                *file = OpenOptions::new().create(true).append(true).open(&path).ok();
+                return;
+            }
+            _ => {}
+        }
+        let size = live.map(|m| m.len()).unwrap_or(0);
+        if size.saturating_add(incoming) > self.retention.live_max_bytes {
+            let ts = now_ms();
+            let gen = generation_path(&path, ts);
+            let _ = fs::rename(&path, &gen);
+            prune_generations(&path, self.retention, ts);
+            *file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .ok();
+        }
     }
 
     /// Emit an incident — a ytrace record with payload.incident=true, for
@@ -423,15 +530,21 @@ impl Provider {
             // non-object payload: wrap
             merged = json!({"incident": true, "complaint_for": "llm", "data": merged});
         }
+        // Scripts watch incidents too (e.g. `governor/fault -> @count`).
+        let ts_ms = now_ms();
+        let comp = component.into();
+        let cat = category.into();
+        let nm = name.into();
+        self.scripts_eval(&comp, &cat, &nm, Clock::Wall.as_str(), None, &merged, ts_ms);
         let rec = YtraceRecord {
             v: YTRACE_WIRE_VERSION,
-            ts_ms: now_ms(),
+            ts_ms,
             pid: std::process::id(),
             app: self.app.clone(),
             app_version: self.app_version.clone(),
-            component: component.into(),
-            category: category.into(),
-            name: name.into(),
+            component: comp,
+            category: cat,
+            name: nm,
             clock: Clock::Wall.as_str().to_string(),
             duration_ms: None,
             payload: merged,
@@ -498,8 +611,20 @@ impl Provider {
         if !is_enabled() {
             return;
         }
+        let component_s = component.into();
         let category_s = category.into();
         let name_s = name.into();
+        let ts_ms = now_ms();
+        // scripts see every span, unsampled, before the file gate
+        self.scripts_eval(
+            &component_s,
+            &category_s,
+            &name_s,
+            clock.as_str(),
+            Some(duration_ms),
+            &payload,
+            ts_ms,
+        );
         if let Some(p) = self.probe_for(&category_s, &name_s) {
             if !should_record(&p, duration_ms) {
                 return;
@@ -507,11 +632,11 @@ impl Provider {
         }
         let rec = YtraceRecord {
             v: YTRACE_WIRE_VERSION,
-            ts_ms: now_ms(),
+            ts_ms,
             pid: std::process::id(),
             app: self.app.clone(),
             app_version: self.app_version.clone(),
-            component: component.into(),
+            component: component_s,
             category: category_s,
             name: name_s,
             clock: clock.as_str().to_string(),
@@ -579,7 +704,8 @@ impl<'a> SpanGuard<'a> {
             return;
         }
         let duration_ms = self.start.elapsed().as_secs_f64() * 1000.0;
-        if !should_record(&self.probe, duration_ms) {
+        let scripts_on = self.provider.control.has_scripts();
+        if !scripts_on && !should_record(&self.probe, duration_ms) {
             return;
         }
         let merged = match (&self.ctx, &payload) {
@@ -594,9 +720,22 @@ impl<'a> SpanGuard<'a> {
             }
             _ => payload,
         };
+        let ts_ms = now_ms();
+        self.provider.scripts_eval(
+            &self.component,
+            &self.probe.category,
+            &self.probe.name,
+            self.probe.clock.as_str(),
+            Some(duration_ms),
+            &merged,
+            ts_ms,
+        );
+        if !should_record(&self.probe, duration_ms) {
+            return;
+        }
         let rec = YtraceRecord {
             v: YTRACE_WIRE_VERSION,
-            ts_ms: now_ms(),
+            ts_ms,
             pid: std::process::id(),
             app: self.provider.app.clone(),
             app_version: self.provider.app_version.clone(),
@@ -628,6 +767,22 @@ impl<'a> Drop for SpanGuard<'a> {
             return;
         }
         let duration_ms = self.start.elapsed().as_secs_f64() * 1000.0;
+        let scripts_on = self.provider.control.has_scripts();
+        if !scripts_on && !should_record(&self.probe, duration_ms) {
+            return;
+        }
+        if scripts_on {
+            let ts_ms = now_ms();
+            self.provider.scripts_eval(
+                &self.component,
+                &self.probe.category,
+                &self.probe.name,
+                self.probe.clock.as_str(),
+                Some(duration_ms),
+                &self.ctx,
+                ts_ms,
+            );
+        }
         if !should_record(&self.probe, duration_ms) {
             return;
         }
@@ -655,3 +810,5 @@ pub mod retention_compat;
 pub mod query;
 pub mod compat;
 pub mod diagnosis;
+pub mod script;
+pub mod control;
