@@ -151,10 +151,60 @@ pub fn socket_path(dir: &Path, app: &str, pid: u32) -> PathBuf {
     dir.join(format!("{app}-{pid}.sock"))
 }
 
+/// Remove socket files in `dir` that nothing is listening on.
+///
+/// Every short-lived process that embeds a provider (each CLI invocation)
+/// binds a control socket and leaks the file on exit — `$XDG_RUNTIME_DIR` is
+/// tmpfs, so dead sockets are resident memory accumulating one per invocation
+/// (measured: 10 dead of 14 within minutes of the script plane shipping).
+/// Pruning runs at provider start: a file that refuses connections and is
+/// older than the grace window is unlinked. The mtime guard protects a
+/// process that has bound but not yet connected-verified its own socket.
+pub fn prune_dead_sockets(dir: &Path, keep: &Path) {
+    prune_dead_sockets_in(dir, keep, 60_000)
+}
+
+/// The mechanism, with the grace window explicit for tests.
+pub fn prune_dead_sockets_in(dir: &Path, keep: &Path, grace_ms: u128) {
+    let now = now_ms_fallback();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p == *keep || p.extension().map(|x| x != "sock").unwrap_or(true) {
+            continue;
+        }
+        if let Ok(meta) = e.metadata() {
+            use std::time::UNIX_EPOCH;
+            let age = meta
+                .modified()
+                .ok()
+                .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            if now.saturating_sub(age) < grace_ms {
+                continue;
+            }
+            if UnixStream::connect(&p).is_err() {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+}
+
+fn now_ms_fallback() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default()
+}
+
 /// Bind the control socket and spawn the accept loop. Best-effort: a failure
 /// to bind (stale socket from a dead process, another provider same app+pid in
 /// a test) leaves the provider fully functional minus remote attach.
 pub fn serve(control: Arc<Control>, dir: &Path, app: &str, pid: u32) -> Option<PathBuf> {
+    prune_dead_sockets(dir, &socket_path(dir, app, pid));
     let path = socket_path(dir, app, pid);
     let _ = std::fs::remove_file(&path); // a dead socket file is not an error
     let listener = UnixListener::bind(&path).ok()?;
@@ -304,6 +354,50 @@ mod tests {
         c.eval("render", "gui", &r, &payload);
         let d = c.drain_reset("all");
         assert_eq!(d["snapshot"]["stats"]["matched"], 1);
+    }
+
+    #[test]
+    fn prune_dead_sockets_removes_only_unconnectable_old_files() {
+        let dir = std::env::temp_dir().join(format!("ytrace-prune-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let control = Arc::new(Control::new("prune-app"));
+        let live = serve(Arc::clone(&control), &dir, "prune-app", 888_001).expect("binds");
+        // a dead socket: bind a listener, drop it, leave the file. (Opening
+        // the file ENXIOs once the listener is gone — that is the definition
+        // of dead here.)
+        let dead_path = dir.join("dead-999999.sock");
+        {
+            let l = UnixListener::bind(&dead_path).unwrap();
+            drop(l);
+        }
+        // a fresh socket file inside the grace window: never touched
+        let fresh_path = dir.join("fresh-999998.sock");
+        {
+            let l = UnixListener::bind(&fresh_path).unwrap();
+            drop(l);
+        }
+
+        prune_dead_sockets_in(&dir, &live, 0);
+
+        assert!(live.exists(), "the live socket survives pruning");
+        assert!(!dead_path.exists(), "the dead socket file is reaped");
+        assert!(!fresh_path.exists(), "grace 0 reaps everything dead, fresh included");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_respects_the_grace_window() {
+        let dir = std::env::temp_dir().join(format!("ytrace-prune2-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let dead_path = dir.join("dead-999997.sock");
+        {
+            let l = UnixListener::bind(&dead_path).unwrap();
+            drop(l);
+        }
+        // huge grace: nothing dies, the starting process is never raced
+        prune_dead_sockets_in(&dir, &dir.join("self.sock"), u128::MAX);
+        assert!(dead_path.exists(), "a fresh dead file inside the grace window survives");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

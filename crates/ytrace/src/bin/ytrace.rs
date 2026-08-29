@@ -457,16 +457,27 @@ fn main() -> Result<()> {
             if targets.is_empty() {
                 anyhow::bail!("no live provider for `{app}` — is the app running?");
             }
+            // A dead advertised socket (a CLI client that exited between its
+            // heartbeat and our connect) must not silence the other targets:
+            // report per-target and keep going.
+            let mut attached = 0usize;
             for t in &targets {
                 let req = match &id {
                     Some(id) => serde_json::json!({"verb":"attach","id":id,"script":script}),
                     None => serde_json::json!({"verb":"attach","script":script}),
                 };
-                let resp = request_ok(&t.sock, &req)?;
+                let resp = match ytrace::control::request(&t.sock, &req) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("⚠ {} pid={}: unreachable ({e}) — skipped", t.app, t.pid);
+                        continue;
+                    }
+                };
                 let derived = resp.get("id").and_then(|v| v.as_str()).unwrap_or("?").to_string();
                 if json {
                     println!("{}", serde_json::to_string_pretty(&resp)?);
                 } else if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    attached += 1;
                     println!(
                         "attached `{}` → {} pid={}{}",
                         derived,
@@ -481,6 +492,9 @@ fn main() -> Result<()> {
                     watch_loop(&t.sock, &derived, watch.unwrap_or(2), reset, json)?;
                 }
             }
+            if attached == 0 {
+                anyhow::bail!("no reachable provider accepted the script for `{app}`");
+            }
         }
         Commands::Detach { app, id, pid } => {
             for t in targets_for(&app, pid) {
@@ -493,7 +507,13 @@ fn main() -> Result<()> {
         }
         Commands::Scripts { app, pid, json } => {
             for t in targets_for(&app, pid) {
-                let resp = request_ok(&t.sock, &serde_json::json!({"verb":"scripts"}))?;
+                let resp = match ytrace::control::request(&t.sock, &serde_json::json!({"verb":"scripts"})) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("⚠ {} pid={}: unreachable ({e}) — skipped", t.app, t.pid);
+                        continue;
+                    }
+                };
                 if json {
                     println!("{}", serde_json::to_string_pretty(&resp)?);
                     continue;
@@ -522,7 +542,13 @@ fn main() -> Result<()> {
         Commands::Drain { app, id, reset, pid, json } => {
             for t in targets_for(&app, pid) {
                 let req = serde_json::json!({"verb":"drain","id":id,"reset":reset});
-                let resp = request_ok(&t.sock, &req)?;
+                let resp = match ytrace::control::request(&t.sock, &req) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("⚠ {} pid={}: unreachable ({e}) — skipped", t.app, t.pid);
+                        continue;
+                    }
+                };
                 if json {
                     println!("{}", serde_json::to_string_pretty(&resp)?);
                     continue;
