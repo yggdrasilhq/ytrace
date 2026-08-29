@@ -203,11 +203,24 @@ fn collect_records(home: &Path, since_ms: Option<u128>, out: &mut Vec<YtraceReco
     );
     let live = home.join("ytrace.jsonl");
     read_one(&live, since_ms, out);
-    // generations
+    // generations. A generation named `ytrace.g<ts>.jsonl` was rotated at `ts`
+    // and therefore holds only records OLDER than `ts` — a generation whose ts
+    // predates the window floor cannot contain a record inside the window, so
+    // it is skippable without reading. Without this, the query tool's cost
+    // grows with the whole retained history (the byte budget exists to bound
+    // the window, not to invite re-reading all of it every query).
     if let Ok(entries) = fs::read_dir(home) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with("ytrace.g") && name.ends_with(".jsonl") {
+            if let Some(rest) = name
+                .strip_prefix("ytrace.g")
+                .and_then(|r| r.strip_suffix(".jsonl"))
+            {
+                if let Ok(gen_ts) = rest.parse::<u128>() {
+                    if since_ms.is_some_and(|floor| gen_ts < floor) {
+                        continue;
+                    }
+                }
                 read_one(&e.path(), since_ms, out);
             }
         }
@@ -377,6 +390,38 @@ pub fn rate_per_min(
 mod window_tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn summarize_skips_generations_entirely_outside_the_window() {
+        // regression: the query tool's cost grew with ALL retained history —
+        // 152 generations (~350MB) scanned for a small window. A generation
+        // rotated before the floor provably holds no in-window record.
+        let dir = std::env::temp_dir().join(format!("ytrace-query-skip-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let home = dir.join("app");
+        let _ = fs::create_dir_all(&home);
+        let floor = 1_700_000_000_000u128; // epoch-shaped, not duration-shaped
+        let mk = |cat: &str, ts: u128| {
+            format!(
+                "{{\"v\":1,\"ts_ms\":{ts},\"pid\":1,\"app\":\"a\",\"app_version\":\"0\",\"component\":\"c\",\"category\":\"{cat}\",\"name\":\"n\",\"clock\":\"wall\",\"payload\":{{}}}}\n"
+            )
+        };
+        // rotated long before the floor: must be skipped without parsing.
+        // The record inside carries an IN-WINDOW timestamp — if the skip is
+        // ever removed, this record resurfaces and the test fails.
+        fs::write(home.join("ytrace.g1699999000000.jsonl"), mk("old", floor + 100)).unwrap();
+        // rotated after the floor: scanned normally
+        fs::write(
+            home.join(format!("ytrace.g{}.jsonl", floor + 500)),
+            mk("new", floor + 100),
+        )
+        .unwrap();
+        let sums = summarize(&home, None, Some(floor));
+        let cats: Vec<_> = sums.iter().map(|s| s.category.as_str()).collect();
+        assert!(cats.contains(&"new"), "in-window generation is scanned: {sums:?}");
+        assert!(!cats.contains(&"old"), "pre-window generation must be skipped, not parsed");
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_duration_in_a_since_slot_is_recognised() {
