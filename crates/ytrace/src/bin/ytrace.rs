@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "ytrace", version, about = "ytrace probe bus CLI — query fleet telemetry file-first")]
@@ -68,6 +68,65 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Attach a script clause to a live provider (durable until detach).
+    ///
+    /// Grammar: `category/name [where EXPR] [-> @agg(EXPR), ...] [by PATH, ...] [keep PATH, ...] [ring N]`
+    Attach {
+        #[arg(long, default_value = "yggterm")]
+        app: String,
+        /// The clause, e.g. `render/gui where duration_ms > 16 -> @quantize(duration_ms)`
+        script: String,
+        /// Script id (default derived from probe + first aggregate).
+        #[arg(long)]
+        id: Option<String>,
+        /// Attach to one specific pid instead of every live provider of the app.
+        #[arg(long)]
+        pid: Option<u32>,
+        /// Poll drain every N seconds and print a compact rate line.
+        #[arg(long)]
+        watch: Option<u64>,
+        /// Reset counters after each drain (true rate views).
+        #[arg(long, default_value_t = false)]
+        reset: bool,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Detach a script.
+    Detach {
+        #[arg(long, default_value = "yggterm")]
+        app: String,
+        id: String,
+        #[arg(long)]
+        pid: Option<u32>,
+    },
+    /// List attached scripts + their anti-false-zero counters.
+    Scripts {
+        #[arg(long, default_value = "yggterm")]
+        app: String,
+        #[arg(long)]
+        pid: Option<u32>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Drain a script's aggregates (rides the socket, never the byte budget).
+    Drain {
+        #[arg(long, default_value = "yggterm")]
+        app: String,
+        id: String,
+        /// Zero the counters after reading (atomic vs emitters).
+        #[arg(long, default_value_t = false)]
+        reset: bool,
+        #[arg(long)]
+        pid: Option<u32>,
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+}
+
+use ytrace::control::request;
+
+fn request_ok(sock: &Path, req: &serde_json::Value) -> Result<serde_json::Value> {
+    request(sock, req).map_err(|e| anyhow::anyhow!(e))
 }
 
 fn parse_since(s: &str) -> Option<u128> {
@@ -272,6 +331,173 @@ fn main() -> Result<()> {
                     eprintln!("(no live providers — stale {}ms)", stale_ms);
                 }
             }
+        }
+        Commands::Attach { app, script, id, pid, watch, reset, json } => {
+            let targets = targets_for(&app, pid);
+            if targets.is_empty() {
+                anyhow::bail!("no live provider for `{app}` — is the app running?");
+            }
+            for t in &targets {
+                let req = match &id {
+                    Some(id) => serde_json::json!({"verb":"attach","id":id,"script":script}),
+                    None => serde_json::json!({"verb":"attach","script":script}),
+                };
+                let resp = request_ok(&t.sock, &req)?;
+                let derived = resp.get("id").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&resp)?);
+                } else if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    println!(
+                        "attached `{}` → {} pid={}{}",
+                        derived,
+                        t.app,
+                        t.pid,
+                        if resp.get("replaced").and_then(|v| v.as_bool()).unwrap_or(false) { " (replaced, aggregates reset)" } else { "" }
+                    );
+                } else {
+                    anyhow::bail!("attach failed: {}", resp.get("error").and_then(|v| v.as_str()).unwrap_or("?"));
+                }
+                if watch.is_some() {
+                    watch_loop(&t.sock, &derived, watch.unwrap_or(2), reset, json)?;
+                }
+            }
+        }
+        Commands::Detach { app, id, pid } => {
+            for t in targets_for(&app, pid) {
+                let resp = request_ok(&t.sock, &serde_json::json!({"verb":"detach","id":id}))?;
+                if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    println!("detached `{id}` from {} pid={} (existed: {})", t.app, t.pid,
+                        resp.get("existed").and_then(|v| v.as_bool()).unwrap_or(false));
+                }
+            }
+        }
+        Commands::Scripts { app, pid, json } => {
+            for t in targets_for(&app, pid) {
+                let resp = request_ok(&t.sock, &serde_json::json!({"verb":"scripts"}))?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&resp)?);
+                    continue;
+                }
+                println!("{} pid={}:", t.app, t.pid);
+                if let Some(scripts) = resp.get("scripts").and_then(|v| v.as_array()) {
+                    if scripts.is_empty() {
+                        println!("  (no scripts attached)");
+                    }
+                    for s in scripts {
+                        let st = &s["stats"];
+                        println!(
+                            "  {:<28} {}",
+                            s["id"].as_str().unwrap_or("?"),
+                            s["script"].as_str().unwrap_or("?")
+                        );
+                        println!(
+                            "    fired={} matched={} schema_miss={} overflow_groups={} ring_dropped={}",
+                            st["fired"], st["matched"], st["schema_miss"],
+                            st["overflow_groups"], st["ring_dropped"]
+                        );
+                    }
+                }
+            }
+        }
+        Commands::Drain { app, id, reset, pid, json } => {
+            for t in targets_for(&app, pid) {
+                let req = serde_json::json!({"verb":"drain","id":id,"reset":reset});
+                let resp = request_ok(&t.sock, &req)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&resp)?);
+                    continue;
+                }
+                if resp.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    print_snapshot(&resp["snapshot"]);
+                } else {
+                    anyhow::bail!("{}", resp.get("error").and_then(|v| v.as_str()).unwrap_or("?"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+struct Target {
+    app: String,
+    pid: u32,
+    sock: PathBuf,
+}
+
+/// Live providers of `app` from the registry — never file-path guessing.
+fn targets_for(app: &str, pid: Option<u32>) -> Vec<Target> {
+    ytrace::registry::list(45_000)
+        .into_iter()
+        .filter(|e| e.app == app)
+        .filter(|e| pid.is_none_or(|p| e.pid == p))
+        .filter_map(|e| {
+            let s = e.socket?;
+            if s.is_empty() {
+                return None;
+            }
+            Some(Target { app: e.app, pid: e.pid, sock: PathBuf::from(s) })
+        })
+        .collect()
+}
+
+fn print_snapshot(snap: &serde_json::Value) {
+    let st = &snap["stats"];
+    println!("== {}  ({})", snap["id"].as_str().unwrap_or("?"), snap["probe"].as_str().unwrap_or("?"));
+    println!("   {}", serde_json::to_string(st).unwrap_or_default());
+    if let Some(groups) = snap["groups"].as_array() {
+        for g in groups {
+            let key = match &g["key"] {
+                serde_json::Value::Null => String::new(),
+                k => format!(" [{}]", k),
+            };
+            let mut parts = vec![format!("count={}", g["count"])];
+            for f in ["sum", "avg", "min", "max"] {
+                if let Some(v) = g.get(f) {
+                    if let Some(n) = v.as_f64() {
+                        parts.push(format!("{f}={n:.3}"));
+                    }
+                }
+            }
+            if let Some(q) = g.get("quantize") {
+                parts.push(format!(
+                    "p50={:?} p95={:?} max={:?}",
+                    q["p50"].as_f64(),
+                    q["p95"].as_f64(),
+                    q["max"].as_f64()
+                ));
+            }
+            println!("   {}{}", key, parts.join(" "));
+        }
+    }
+    if let Some(ring) = snap["ring"].as_array() {
+        println!("   ring ({}):", ring.len());
+        for r in ring.iter().rev().take(5) {
+            println!("     {}", serde_json::to_string(r).unwrap_or_default());
+        }
+    }
+}
+
+fn watch_loop(sock: &Path, id: &str, every_secs: u64, reset: bool, json: bool) -> Result<()> {
+    let req = serde_json::json!({"verb":"drain","id":id,"reset":reset});
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(every_secs));
+        let resp = match ytrace::control::request(sock, &req) {
+            Ok(r) => r,
+            Err(_) => break, // process died — stop watching
+        };
+        if json {
+            println!("{}", serde_json::to_string(&resp["snapshot"])?);
+        } else {
+            let s = &resp["snapshot"]["stats"];
+            let interval = every_secs as f64;
+            println!(
+                "[watch] fired/s={:.1} matched/s={:.1} schema_miss={} groups={} ring={}",
+                s["fired"].as_f64().unwrap_or(0.0) / interval,
+                s["matched"].as_f64().unwrap_or(0.0) / interval,
+                s["schema_miss"],
+                s["groups"],
+                s.get("ring_dropped").map(|v| v.to_string()).unwrap_or_default(),
+            );
         }
     }
     Ok(())
