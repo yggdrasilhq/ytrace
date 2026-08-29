@@ -60,3 +60,12 @@ ytrace registry --list --stale 45s
 ## Notebooks — Dash is exclusively ytrace (book pages in ytop sidebar)
 
 `ytop` notebooks are the book interface for ytrace: **Top** shelf has no ytrace (host atlas), **Dash** shelf is exclusively ytrace profiling adventures. Any agent on any host composes via `ytop` skill `POST /action notebook_compose_{top,dash}` (stdin-fed, never argv-joined) → `~/.local/share/ytop/notebooks/<id>.json`. See `ytop/.agents/skills/ytop-notebooks/SKILL.md` and `ytop/src/notebook.rs` (base notebooks: `top-atlas`, `dash-angry-gui`, `dash-idle-cost`).
+
+## Script plane (0.2.0) — DTrace-class, runtime-attached
+
+Providers since 0.2.0 run a control socket (`$XDG_RUNTIME_DIR/ytrace/<app>-<pid>.sock`, advertised in the registry). Scripts compile an in-process IR at attach; the emit path pays one relaxed atomic load when none are attached. SSOT: `docs/spec-ytrace.md` §11.
+
+- **Laws:** scripts see every firing unsampled (sampling is file-policy only) · attach is durable (always-on instrumentation) · drains ride the socket, never the JSONL byte budget · all bounds report their own overflow · `fired/matched/schema_miss` are distinct (anti-false-zero).
+- **Non-goals:** loops, variables, user functions, cross-probe joins (correlate in a sink script or a ytop notebook).
+
+If you embed ytrace in an app, you get the script plane for free — register probes as before; nothing else to wire.

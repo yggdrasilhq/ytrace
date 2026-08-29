@@ -27,11 +27,12 @@
 | provider | `app` id | `yggterm`, `ychrome`, `ytop`, `myapp` |
 | module | `component` | `daemon`, `shell`, `render`, `web_surface` |
 | probe | `probe` = `category/name` | `daemon_request/status`, `render/gui`, `web/fetch` |
-| predicate | sampling policy | `floor=8ms sample 1:50` |
-| action | `clock` + `payload` | `wall 1.38ms {rows:54}` · `cpu 0.12ms {gpu_ms:1.4}` |
+| predicate | sampling policy, or a runtime script `where` clause (§11) | `floor=8ms sample 1:50` · `where duration_ms > 16` |
+| action | `clock` + `payload`; script aggregates `@quantize/@count/...` (§11) | `wall 1.38ms {rows:54}` · `@quantize(duration_ms) by payload.host_id` |
 
 * A provider **declares** probes; the wire is append-only JSONL so a reader never needs the declarer live.
 * Zero overhead when off: `ytrace::is_enabled()` is one relaxed atomic; `Span`/`Event` constructors early-return. Spans stay compiled in.
+* Scripts (§11) attach at runtime over the control socket; the hot path pays one relaxed atomic load when none are attached.
 
 ---
 
@@ -188,16 +189,87 @@ YT.event("cache/evict", json!({"keys": 3}));
 
 ---
 
-## 10. File map
+## 11. The script plane — runtime-attached predicates + aggregates (v1, 0.2.0)
+
+The DTrace half. Scripts attach at runtime over the control socket, compile to an
+in-process IR, and answer questions **where the events are born**. One semantics:
+the whole clause compiles or attach fails with a precise error — there is no tier
+in which the same text means something different.
+
+### 11.1 The grammar (the whole language — one screen)
+
+```
+script   := PROBE ["where" expr] ["->" agg ("," agg)*] ["by" path ("," path)*]
+            ["keep" path ("," path)*] ["ring" N]
+agg      := "@" ("count" | ("sum"|"min"|"max"|"avg"|"quantize") expr)
+expr     := comparisons (== != < <= > >=), arithmetic (+ - * /), && || ! parens
+path     := bare = record header (`duration_ms` `component` `category` `name`
+            `clock` `pid` `app` `ts_ms`) · `payload.x.y` = payload field
+```
+
+```sh
+# slow frames: log2 latency histogram per host, since attach
+ytrace attach --app yggterm 'render/gui where duration_ms > 16 -> @quantize(duration_ms) by payload.host_id'
+
+# the µs-per-row slope case — arithmetic inside aggregate arguments
+ytrace attach --app yggterm 'render/gui -> @quantize(duration_ms / payload.rows * 1000)'
+
+# crime-scene capture: last 32 matching records, byte-capped, truncation is visible
+ytrace attach --app yggterm 'daemon_terminal_read where payload.pending_chars == 0 keep payload, duration_ms ring 32'
+
+ytrace scripts --app yggterm          # status + anti-false-zero counters
+ytrace drain --app yggterm <id> --reset --watch 2   # live rate view
+ytrace detach --app yggterm <id>
+```
+
+### 11.2 Laws (each one is load-bearing)
+
+1. **Scripts see every firing, unsampled.** Sampling is a FILE-stream policy; a
+   `@quantize` that saw 1:50 of fast frames would be a lying instrument.
+2. **Attach is durable.** The CLI attaches and exits; aggregates accumulate until
+   explicit detach or process death. Always-on instrumentation is the point.
+3. **Drains ride the socket, never the plane.** Aggregate snapshots do not
+   consume the JSONL byte budget — an instrument must not shorten the
+   diagnostic window it exists to extend.
+4. **Bounded by construction.** No loops, no user code. ≤1024 groups (+1 counted
+   overflow bucket), ring ≤4096, captures >4 KiB truncate to a visible marker,
+   script ≤4 KiB, ≤8 aggregates. Every bound reports its own overflow count.
+5. **Anti-false-zero.** `fired / matched / schema_miss` are distinct stats:
+   "probe never fired" ≠ "predicate never matched" ≠ "record didn't look the way
+   the script assumed". A missing field or type mismatch bumps `schema_miss`
+   and fails the predicate — never silent.
+
+### 11.3 Non-goals (v1)
+
+No loops, no variables, no user functions, no string transforms beyond equality,
+no joins across probes (cross-probe correlation lives in the streaming sink or
+ytop notebooks — join state is unbounded by nature and must not enter the
+in-process VM). Probes remain statically declared; this is not uprobes.
+
+### 11.4 Wire & protocol
+
+The v1 record wire is frozen and untouched. Control socket: 
+`$XDG_RUNTIME_DIR/ytrace/<app>-<pid>.sock` (advertised in the registry when
+bound). Line-delimited JSON: `{"verb":"attach","id":opt,"script":"..."}` /
+`{"verb":"detach","id"}` / `{"verb":"scripts"}` / `{"verb":"drain","id","reset"}`
+/ `{"verb":"ping"}`. Drain snapshots carry `payload.aggregate`-shaped groups
+(`key`, `count`, `sum/avg/min/max`, `quantize{min,max,p50,p95,p99,buckets}`)
+plus `ring` captures and the stats block of §11.2.5.
+
+---
+
+## 12. File map
 
 ```
 ~/gh/ytrace/
   docs/spec-ytrace.md              # this file
   crates/ytrace/src/
-    lib.rs                         # Provider, Probe, Span, Event, Metric
-    retention.rs                   # generational retention (from yggterm-core)
+    lib.rs                         # Provider, Probe, SpanGuard, held-handle append, script hook
+    script.rs                      # script IR, clause parser, aggregates, bounds
+    control.rs                     # control socket server + client (attach/detach/drain)
     registry.rs                    # discovery heartbeat + prune
     query.rs                       # summarize / tail / incidents client
     compat.rs                      # yggterm/perf alias shim
-  .agents/skills/ytrace/SKILL.md   # agent dev integration guide (in ytop + ytrace)
+  crates/ytrace/examples/mini_provider.rs   # live end-to-end demo
+  .agents/skills/ytrace/SKILL.md   # agent dev integration guide
 ```

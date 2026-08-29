@@ -255,7 +255,7 @@ fn main() -> Result<()> {
             let since_ms = since.as_deref().and_then(parse_since);
             // --lines N dominates; default 20
             let n = lines.unwrap_or(20);
-            let mut recs = if let Some(cat) = category {
+            let recs = if let Some(cat) = category {
                 let all = ytrace::query::tail(&home, 100_000, since_ms);
                 let mut filtered: Vec<_> = all.into_iter().filter(|r| r.category == cat).collect();
                 filtered.sort_by_key(|r| r.ts_ms);
