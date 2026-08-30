@@ -12,6 +12,17 @@ pub struct RegistryEntry {
     pub socket: Option<String>,
     pub ts_ms: u128,
     pub probes: Vec<String>,
+    /// Immutable identity of the engine that owns the advertised socket
+    /// (2026-08-30 multi-provider fix). A client attaching over the socket
+    /// REFUSES when the live `gen` differs from this one — the mismatch is the
+    /// shape that accepted attaches and drained confident false zeroes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket_gen: Option<u64>,
+    /// Digest of the catalogue the row advertises (FNV-1a of the sorted probe
+    /// list — see `control::catalogue_digest_of`). Informational: the live
+    /// catalogue may have grown since the heartbeat; `gen` is the identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalogue_digest: Option<u64>,
 }
 
 fn registry_path() -> PathBuf {
@@ -63,12 +74,35 @@ pub fn heartbeat(app: &str, version: &str, home: &Path, socket: Option<&Path>) {
 /// liveness list: a consumer that cannot ask "what can this provider tell me"
 /// has to hard-code probe names, which is a second copy of the provider's own
 /// declaration.
+///
+/// ⛔ **The list must be the process-wide UNION, not one provider's slice.**
+/// With the per-provider list, whichever provider emitted first after the
+/// heartbeat gate claimed the single (app,pid) row with its own partial
+/// catalogue — the registry's advertised probes flip-flopped between 3 and 33
+/// with no restart (live-witnessed on the build host, 2026-08-30). Providers
+/// sharing `control::acquire` pass `Control::catalogue()` here.
 pub fn heartbeat_with_probes(
     app: &str,
     version: &str,
     home: &Path,
     socket: Option<&Path>,
     probes: &[String],
+) {
+    heartbeat_full(app, version, home, socket, probes, None, None)
+}
+
+/// `heartbeat_with_probes` plus the engine identity: the socket generation and
+/// the catalogue digest ride the row so an attaching client can refuse a
+/// registry/socket mismatch instead of draining a confident false zero.
+#[allow(clippy::too_many_arguments)]
+pub fn heartbeat_full(
+    app: &str,
+    version: &str,
+    home: &Path,
+    socket: Option<&Path>,
+    probes: &[String],
+    socket_gen: Option<u64>,
+    catalogue_digest: Option<u64>,
 ) {
     use std::sync::atomic::Ordering;
     let now = now_ms();
@@ -97,6 +131,8 @@ pub fn heartbeat_with_probes(
         socket: socket.map(|p| p.to_string_lossy().to_string()),
         ts_ms: now,
         probes: probes.to_vec(),
+        socket_gen,
+        catalogue_digest,
     };
     if let Ok(line) = serde_json::to_vec(&entry) {
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
@@ -160,8 +196,13 @@ pub fn compact_if_needed(path: &Path, max_bytes: u64, now: u128) {
 }
 
 pub fn list(stale_ms: u128) -> Vec<RegistryEntry> {
-    let path = registry_path();
-    let Ok(f) = fs::File::open(&path) else {
+    list_from(&registry_path(), stale_ms)
+}
+
+/// `list` against an explicit file — the test seam (and any reader that wants
+/// to pin a snapshot instead of the live runtime file).
+pub fn list_from(path: &Path, stale_ms: u128) -> Vec<RegistryEntry> {
+    let Ok(f) = fs::File::open(path) else {
         return Vec::new();
     };
     let now = now_ms();
@@ -198,6 +239,8 @@ mod tests {
             socket: None,
             ts_ms,
             probes: vec!["example/probe".to_string()],
+            socket_gen: None,
+            catalogue_digest: None,
         }
     }
 
@@ -293,6 +336,28 @@ mod tests {
             .filter(|n| n.contains("compacting"))
             .collect();
         assert!(leftovers.is_empty(), "temp file left behind: {leftovers:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn identity_fields_roundtrip_and_old_rows_still_parse() {
+        let dir = tmpdir("identity");
+        let path = dir.join("registry.jsonl");
+        // a NEW row (with identity) and an OLD row (pre-0.2.1, fields absent);
+        // both carry FRESH timestamps so the staleness filter keeps them
+        let now = now_ms();
+        let mut new_row = entry("alpha", 1, now);
+        new_row.socket_gen = Some(0xdead_beef);
+        new_row.catalogue_digest = Some(42);
+        new_row.socket = Some("/run/user/1000/ytrace/alpha-1.sock".to_string());
+        write_lines(&path, &[new_row, entry("beta", 2, now)]);
+
+        let rows = list_from(&path, 45_000);
+        assert_eq!(rows.len(), 2, "an old row without identity fields still parses");
+        let alpha = rows.iter().find(|e| e.app == "alpha").unwrap();
+        assert_eq!(alpha.socket_gen, Some(0xdead_beef));
+        assert_eq!(alpha.catalogue_digest, Some(42));
+        assert_eq!(rows.iter().find(|e| e.app == "beta").unwrap().socket_gen, None);
         let _ = fs::remove_dir_all(&dir);
     }
 }

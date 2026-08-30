@@ -36,3 +36,11 @@ span.finish(json!({"status": 200}));
 ```
 
 See `Provider`, `SpanGuard`, `Clock`, `Sample` in `crates/ytrace/src/lib.rs`.
+
+**Composable providers (0.2.1).** A process may build several Providers of
+the same app (yggterm builds four) — they all join ONE control plane per
+`(app, pid)`: one socket, one script engine, one registry row whose catalogue
+is the union of every provider's probes, plus an immutable `gen` so an
+attaching client can refuse a registry/socket mismatch instead of draining a
+confident false zero. Never call `control::serve` directly from a second
+provider — use `Provider::new`/`with_home`, which `acquire` the shared plane.

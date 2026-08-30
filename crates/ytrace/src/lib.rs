@@ -229,7 +229,10 @@ fn should_record(probe: &Probe, duration_ms: f64) -> bool {
     SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed) % rate == 0
 }
 
-/// A ytrace provider — one per app process.
+/// A ytrace provider. Composable: a process may build several (yggterm builds
+/// four), and they all join ONE control plane per (app, pid) — one socket, one
+/// script engine, one registry row whose catalogue is the union of every
+/// provider's probes.
 pub struct Provider {
     pub app: String,
     pub app_version: String,
@@ -268,11 +271,15 @@ impl Provider {
         let home = home.into();
         let _ = fs::create_dir_all(&home);
         let app = app.into();
-        // Script engine + best-effort control socket. A failed bind (stale
-        // socket, pid collision) costs nothing: emission is unaffected.
-        let control = Arc::new(control::Control::new(&app));
-        let socket = control::control_dir()
-            .and_then(|dir| control::serve(Arc::clone(&control), &dir, &app, std::process::id()));
+        // Script engine + best-effort control socket. ⛔ `acquire`, never
+        // `serve` directly: a process may build several Providers for one app
+        // (yggterm builds four), and each of them binding `<app>-<pid>.sock`
+        // unlinked the previous live listener — its attached scripts became
+        // unreachable and the registry's single (app,pid) row flipped its
+        // catalogue to the last rebinder. `acquire` joins the first engine.
+        let (control, socket) = control::control_dir()
+            .map(|dir| control::acquire(&app, &dir, std::process::id()))
+            .unwrap_or_else(|| (Arc::new(control::Control::new(&app)), None));
         Self {
             app,
             app_version: app_version.into(),
@@ -312,6 +319,12 @@ impl Provider {
     ) {
         let category = category.into();
         let name = name.into();
+        // Advertise into the PROCESS-wide catalogue (the shared engine's
+        // union) before the names move into the probe map. The registry
+        // heartbeat publishes this union, so the (app,pid) row stops
+        // flip-flopping between partial catalogues.
+        self.control
+            .advertise(&[format!("{}/{}", category, name)]);
         let mut map = self.probes.lock().unwrap();
         map.insert(
             (category.clone(), name.clone()),
@@ -451,17 +464,22 @@ impl Provider {
         // Best-effort registry heartbeat. This is on the EMIT path, so it runs
         // once per record; the 15 s interval gate keeps the discovery index
         // from growing at the rate of the event stream.
-        let probes: Vec<String> = self
-            .probes
-            .lock()
-            .map(|m| m.keys().map(|(c, n)| format!("{c}/{n}")).collect())
-            .unwrap_or_default();
-        registry::heartbeat_with_probes(
+        //
+        // ⛔ The advertised list is the process-wide catalogue UNION from the
+        // shared engine — never this Provider's slice. With per-provider
+        // slices, whichever provider emitted first after the gate claimed the
+        // single (app,pid) row with a partial catalogue (live-witnessed:
+        // 3 ⇄ 33 probes with no restart). gen + digest ride the row so an
+        // attaching client can refuse a registry/socket mismatch.
+        let probes = self.control.catalogue();
+        registry::heartbeat_full(
             &self.app,
             &self.app_version,
             &self.home,
             self.socket.as_deref(),
             &probes,
+            Some(self.control.gen()),
+            Some(self.control.catalogue_digest()),
         );
     }
 
@@ -812,3 +830,68 @@ pub mod compat;
 pub mod diagnosis;
 pub mod script;
 pub mod control;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The audit's end-to-end shape, at the Provider level: four yggterm-style
+    /// providers, one process, one app — ONE control plane, one socket, one
+    /// catalogue (the union), and a script attached through provider A seeing
+    /// provider B's emissions.
+    #[test]
+    fn many_providers_one_process_one_control_plane() {
+        let app = format!("compose-{}", std::process::id());
+        let home = std::env::temp_dir().join(format!("ytrace-compose-{}", std::process::id()));
+        let _ = fs::create_dir_all(&home);
+
+        let p_trace = Provider::with_home(app.clone(), "t", home.clone());
+        let p_perf = Provider::with_home(app.clone(), "t", home.clone());
+        let p_gov = Provider::with_home(app.clone(), "t", home.clone());
+        let p_panic = Provider::with_home(app.clone(), "t", home.clone());
+
+        p_trace.register("trace/gui", Clock::Wall, Sample::always());
+        p_perf.register("daemon_request/snapshot", Clock::Wall, Sample::always());
+        p_gov.register("governor/fault", Clock::Wall, Sample::always());
+        p_panic.register("host/panic", Clock::Wall, Sample::always());
+
+        // one socket for all four
+        let sock = p_trace.socket_path().expect("the first provider binds");
+        assert_eq!(p_perf.socket_path(), Some(sock));
+        assert_eq!(p_gov.socket_path(), Some(sock));
+        assert_eq!(p_panic.socket_path(), Some(sock));
+
+        // the catalogue is the UNION — what the registry now advertises
+        let cat = p_perf.control().catalogue();
+        for expected in ["trace/gui", "daemon_request/snapshot", "governor/fault", "host/panic"] {
+            assert!(cat.iter().any(|p| p == expected), "{expected} missing from {cat:?}");
+        }
+
+        // a script for the perf provider's probe, attached through the SHARED
+        // engine, fires on the perf provider's emission routed by ANOTHER
+        // provider's engine handle (they are all the same Arc).
+        let resp = p_trace
+            .control()
+            .attach(Some("audit".into()), "daemon_request/snapshot -> @count")
+            .unwrap();
+        assert_eq!(resp["ok"], true);
+        p_perf.emit_span(
+            "d",
+            "daemon_request",
+            "snapshot",
+            Clock::Wall,
+            5.0,
+            serde_json::json!({"op": "x"}),
+        );
+        let d = p_gov.control().drain("audit");
+        assert_eq!(
+            d["snapshot"]["stats"]["matched"], 1,
+            "one control plane routes every provider's emissions"
+        );
+
+        // the registry row the heartbeat writes carries the engine identity
+        assert_eq!(p_perf.control().gen(), p_panic.control().gen());
+        assert_ne!(p_perf.control().gen(), 0);
+        let _ = fs::remove_dir_all(&home);
+    }
+}

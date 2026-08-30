@@ -460,8 +460,46 @@ fn main() -> Result<()> {
             // A dead advertised socket (a CLI client that exited between its
             // heartbeat and our connect) must not silence the other targets:
             // report per-target and keep going.
+            //
+            // ⛔ The canary runs BEFORE the attach: a script that reaches the
+            // wrong provider of a multi-provider process is ACCEPTED and then
+            // drains fired=0/matched=0/schema_miss=0 — a confident false zero
+            // (the gpt-tracing audit's critical finding, live-proven
+            // 2026-08-30). A generation mismatch or an absent probe is a
+            // refusal, not a warning.
+            let probe = probe_from_clause(&script);
             let mut attached = 0usize;
             for t in &targets {
+                match ytrace::control::canary(
+                    &t.sock,
+                    t.gen,
+                    probe
+                        .as_ref()
+                        .map(|(c, n)| (c.as_str(), n.as_str())),
+                ) {
+                    Ok(report) => {
+                        if !report.catalogue_checked {
+                            eprintln!(
+                                "⚠ {} pid={}: provider answered no catalogue (older build) — attach unverified",
+                                t.app, t.pid
+                            );
+                        } else if let (Some(reg), Some(live)) = (t.digest, report.digest) {
+                            if reg != live {
+                                // The catalogue only grows (advertise is a union),
+                                // so a digest drift means the row's heartbeat
+                                // predates a new registration — informational.
+                                eprintln!(
+                                    "ℹ {} pid={}: registry catalogue is older than the live one (provider registered probes since its heartbeat) — live catalogue authoritative",
+                                    t.app, t.pid
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("✗ {} pid={}: REFUSED — {e}", t.app, t.pid);
+                        continue;
+                    }
+                }
                 let req = match &id {
                     Some(id) => serde_json::json!({"verb":"attach","id":id,"script":script}),
                     None => serde_json::json!({"verb":"attach","script":script}),
@@ -493,7 +531,9 @@ fn main() -> Result<()> {
                 }
             }
             if attached == 0 {
-                anyhow::bail!("no reachable provider accepted the script for `{app}`");
+                anyhow::bail!(
+                    "no provider accepted the script for `{app}` — refusal reasons (if any) are named above; `ytrace query` reads the file plane regardless"
+                );
             }
         }
         Commands::Detach { app, id, pid } => {
@@ -568,6 +608,9 @@ struct Target {
     app: String,
     pid: u32,
     sock: PathBuf,
+    /// The registry row's socket generation — the canary's expectation.
+    gen: Option<u64>,
+    digest: Option<u64>,
 }
 
 /// Live providers of `app` from the registry — never file-path guessing.
@@ -581,9 +624,27 @@ fn targets_for(app: &str, pid: Option<u32>) -> Vec<Target> {
             if s.is_empty() {
                 return None;
             }
-            Some(Target { app: e.app, pid: e.pid, sock: PathBuf::from(s) })
+            Some(Target {
+                app: e.app,
+                pid: e.pid,
+                sock: PathBuf::from(s),
+                gen: e.socket_gen,
+                digest: e.catalogue_digest,
+            })
         })
         .collect()
+}
+
+/// The `category/name` head of a clause, for the attach canary's catalogue
+/// check. Light parse on purpose — the provider compiles the full clause and
+/// reports its own errors; this only has to name the probe being scripted.
+fn probe_from_clause(clause: &str) -> Option<(String, String)> {
+    let head = clause.split_whitespace().next()?;
+    let (c, n) = head.split_once('/')?;
+    if c.is_empty() || n.is_empty() {
+        return None;
+    }
+    Some((c.to_string(), n.to_string()))
 }
 
 fn print_snapshot(snap: &serde_json::Value) {

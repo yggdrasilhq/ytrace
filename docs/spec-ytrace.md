@@ -114,6 +114,17 @@ $XDG_RUNTIME_DIR/ytrace/<app>-<pid>.sock
 ```
 
 * JSON request/response over Unix socket (`{"verb":"snapshot"}` → `{"v":1, ...}`), versioned. Absence is not an error — file transport already carries the history.
+* **One socket per (app, pid) — never one per Provider.** A process may build
+  many Providers; they all join one control plane via `control::acquire`. The
+  first binds; joiners share the engine by `Arc`. A Provider that called
+  `serve` directly would unlink the previous live listener (its scripts
+  stranded on an unreachable inode) — the defect the 2026-08-30
+  multi-provider audit caught live.
+* **Identity.** Every control-plane answer (`ping`, `catalogue`, `attach`)
+  carries `gen` (immutable per process, minted at bind) and `digest` (FNV-1a
+  of the sorted catalogue). The registry row carries the same `gen` as
+  `socket_gen`; an attaching client REFUSES on mismatch instead of installing
+  a script that would drain a confident false zero.
 
 ### 5.3 Registry (discovery)
 
@@ -125,9 +136,18 @@ $XDG_RUNTIME_DIR/ytrace/registry.jsonl   # one line per provider heartbeat
 Each provider every 15 s appends (or upserts in `registry.json` alternative) :
 
 ```json
-{"app":"yggterm","pid":3102070,"version":"3.0.154","home":"/home/pi/.local/share/ytrace/yggterm","socket":"/run/user/1000/ytrace/yggterm-3102070.sock","ts_ms":1723900000123,"probes":["daemon_request/status","render/gui"]}
+{"app":"yggterm","pid":3102070,"version":"3.0.154","home":"/home/user/.local/share/ytrace/yggterm","socket":"/run/user/1000/ytrace/yggterm-3102070.sock","ts_ms":1723900000123,"probes":["daemon_request/status","render/gui"],"socket_gen":16647493043968770284,"catalogue_digest":14732332207944016278}
 ```
 
+* `probes` is the **process-wide UNION** of every Provider's registered probes
+  (from the shared engine's catalogue) — never one provider's slice. The
+  per-provider slice let whichever provider emitted first after the heartbeat
+  gate claim the row with a partial catalogue; the advertised probes
+  flip-flopped between 3 and 33 with no restart (live-witnessed 2026-08-30).
+* `socket_gen` / `catalogue_digest` are optional (absent in pre-0.2.1 rows;
+  readers must tolerate both shapes). `gen` is identity; the digest is
+  informational — the live catalogue may have grown since the heartbeat
+  (advertisement is a union; it only grows).
 * `ytop` discovers by reading the registry (local read or ssh `cat` of the same path) — no installed agent, no argv-smuggling (`ssh host python3 -c` trap), just stdin-fed JSON.
 * Stale entries: `now - ts_ms > 45s` → dead provider (same as `ControlMaster 45s` for ytop fan-out).
 
@@ -252,9 +272,25 @@ The v1 record wire is frozen and untouched. Control socket:
 `$XDG_RUNTIME_DIR/ytrace/<app>-<pid>.sock` (advertised in the registry when
 bound). Line-delimited JSON: `{"verb":"attach","id":opt,"script":"..."}` /
 `{"verb":"detach","id"}` / `{"verb":"scripts"}` / `{"verb":"drain","id","reset"}`
-/ `{"verb":"ping"}`. Drain snapshots carry `payload.aggregate`-shaped groups
-(`key`, `count`, `sum/avg/min/max`, `quantize{min,max,p50,p95,p99,buckets}`)
-plus `ring` captures and the stats block of §11.2.5.
+/ `{"verb":"ping"}` / `{"verb":"catalogue"}`. Drain snapshots carry
+`payload.aggregate`-shaped groups (`key`, `count`, `sum/avg/min/max`,
+`quantize{min,max,p50,p95,p99,buckets}`) plus `ring` captures and the stats
+block of §11.2.5.
+
+**Identity + the attach canary (0.2.1).** `ping` answers
+`{"ok":true,"gen":u64,"digest":u64,"probes_n":n,"app":...}`; `catalogue`
+answers the full sorted probe list plus the same identity; a successful
+`attach` echoes it. The CLI runs the canary BEFORE installing a script:
+
+* registry `socket_gen` ≠ live `gen` → **refuse** (the socket is not the
+  process the registry described — the shape that accepted attaches and then
+  drained `fired=0/matched=0/schema_miss=0`, a confident false zero);
+* the clause's probe absent from the live catalogue → **refuse** (the script
+  would drain zero forever; the file plane remains a separate positive
+  control via `ytrace query`);
+* an old provider that answers no identity and rejects `catalogue` → attach
+  proceeds **unverified** with a printed warning (mixed versions mid-roll
+  must not hard-fail).
 
 ---
 

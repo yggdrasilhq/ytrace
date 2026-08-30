@@ -128,10 +128,10 @@ pub const HOST_OUR_CORES_PANIC: f64 = 2.0;
 ///
 /// 128 MiB in prod, 4 GiB in dev (2026-08-23): `YGGTERM_DEV=1` or
 /// `~/.yggterm/config/dev-mode` contains `1` means the fleet dev hosts run
-/// `yggterm-uglass` sway isolation on tmpfs (`/run/user/3001`), which
+/// `yggterm-uglass` sway isolation on tmpfs (`/run/user/<uid>`), which
 /// legitimately holds `mesa_shader_cache`/`uv`/`WPE` caches. The 128M threshold
 /// was the unbounded-npm writer (1.5G x3 → 6.7G tmpfs); after deduplicating
-/// uglass `npm` via symlink to `/home/pi/.yggterm/npm` (-4.3G → 2.4G), the
+/// uglass `npm` via symlink to `<home>/.yggterm/npm` (-4.3G → 2.4G), the
 /// residual 2.x GiB is sway/WPE caches, not an yggterm leak. Dev threshold
 /// 4G still catches the leak (1.5G x3 would be 4.5G) without firing on warm
 /// caches.
