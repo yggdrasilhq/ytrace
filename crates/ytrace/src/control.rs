@@ -105,18 +105,38 @@ impl Control {
     pub fn advertise(&self, probes: &[String]) {
         let mut set = self.probes.lock().unwrap();
         for p in probes {
-            set.insert(p.clone());
+            if !set.contains(p) {
+                set.insert(p.clone());
+            }
         }
     }
 
-    /// The live catalogue — every probe registered by any Provider of this
-    /// (app, pid), sorted.
+    /// The live catalogue — every probe this process can script: those
+    /// explicitly registered AND every probe actually emitted since process
+    /// start (callers emit unregistered probes freely; the library resolves
+    /// them with default policy). Sorted.
     pub fn catalogue(&self) -> Vec<String> {
         self.probes.lock().unwrap().iter().cloned().collect()
     }
 
     pub fn catalogue_digest(&self) -> u64 {
         catalogue_digest_of(&self.catalogue())
+    }
+
+    /// Record an emission into the catalogue. The catalogue is SELF-TRUTHING:
+    /// callers emit unregistered probes freely (the library resolves them with
+    /// default policy), and a script matches by (category, name) regardless of
+    /// registration — so "what this process can script" is registered ∪
+    /// emitted, and the attach canary must consult exactly that set. Without
+    /// this, the canary refuses scripts for probes that are actively firing
+    /// (live-measured: a probe at 721 records/10 min absent from the
+    /// registration-only catalogue).
+    pub fn note_emitted(&self, category: &str, name: &str) {
+        let mut set = self.probes.lock().unwrap();
+        let key = format!("{category}/{name}");
+        if !set.contains(&key) {
+            set.insert(key);
+        }
     }
 
     pub fn has_scripts(&self) -> bool {
@@ -781,6 +801,30 @@ mod tests {
         let ok = canary(&path, None, Some(("trace", "gui"))).expect("present probe passes");
         assert!(ok.catalogue_checked);
         assert_eq!(ok.probes_n, Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The catalogue is SELF-TRUTHING: a probe the process EMITTED (even one
+    /// never registered) becomes attachable. Live-measured 2026-08-30: a probe
+    /// firing 721×/10 min was refused because registration and emission are
+    /// different facts — the canary must consult the emitted set too.
+    #[test]
+    fn an_emitted_unregistered_probe_becomes_attachable() {
+        let dir = std::env::temp_dir().join(format!("ytrace-emitcat-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let control = Arc::new(Control::new("emitcat-app"));
+        let path = serve(Arc::clone(&control), &dir, "emitcat-app", 777_006).expect("binds");
+
+        let err = canary(&path, None, Some(("daemon_request", "terminal_app_declares")))
+            .expect_err("before any emission the probe is unobserved");
+        assert!(err.contains("not in the live provider's catalogue"), "{err}");
+
+        // the emit path records the probe (control::note_emitted — the
+        // Provider calls this in scripts_eval before any gate)
+        control.note_emitted("daemon_request", "terminal_app_declares");
+        let ok = canary(&path, None, Some(("daemon_request", "terminal_app_declares")))
+            .expect("an emitted probe is attachable, registered or not");
+        assert!(ok.catalogue_checked);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

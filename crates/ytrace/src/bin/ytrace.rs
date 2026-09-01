@@ -116,6 +116,13 @@ enum Commands {
         /// Attach to one specific pid instead of every live provider of the app.
         #[arg(long)]
         pid: Option<u32>,
+        /// Attach a script whose probe has not been observed firing this
+        /// process generation. The canary refuses absent probes because a
+        /// misspelled or dead probe would drain fired=0 forever; pass this to
+        /// attach anyway (e.g. a rare probe that has not fired since boot).
+        /// A socket-generation mismatch is NEVER bypassed by this flag.
+        #[arg(long, default_value_t = false)]
+        allow_unobserved: bool,
         /// Poll drain every N seconds and print a compact rate line.
         #[arg(long)]
         watch: Option<u64>,
@@ -452,7 +459,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Attach { app, script, id, pid, watch, reset, json } => {
+        Commands::Attach { app, script, id, pid, watch, reset, json, allow_unobserved } => {
             let targets = targets_for(&app, pid);
             if targets.is_empty() {
                 anyhow::bail!("no live provider for `{app}` — is the app running?");
@@ -496,8 +503,16 @@ fn main() -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        eprintln!("✗ {} pid={}: REFUSED — {e}", t.app, t.pid);
-                        continue;
+                        let absent = e.contains("is not in the live provider's catalogue");
+                        if absent && allow_unobserved {
+                            eprintln!(
+                                "⚠ {} pid={}: probe unobserved this generation (--allow-unobserved) — attaching anyway; if it never fires the counters stay zero",
+                                t.app, t.pid
+                            );
+                        } else {
+                            eprintln!("✗ {} pid={}: REFUSED — {e}", t.app, t.pid);
+                            continue;
+                        }
                     }
                 }
                 let req = match &id {

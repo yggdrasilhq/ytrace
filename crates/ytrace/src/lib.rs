@@ -377,6 +377,10 @@ impl Provider {
         payload: &Value,
         ts_ms: u128,
     ) {
+        // Self-truthing catalogue: record the emission even when no script is
+        // attached — the attach canary consults this set later, and its
+        // refusals are only honest if it sees every probe that ever fired.
+        self.control.note_emitted(category, name);
         if self.control.has_scripts() {
             let r = script::RecRef {
                 ts_ms,
@@ -721,6 +725,11 @@ impl<'a> SpanGuard<'a> {
         if !is_enabled() {
             return;
         }
+        // Self-truthing catalogue even on the sampled-out path: the probe
+        // fired, so a later attach must not be refused for it.
+        self.provider
+            .control
+            .note_emitted(&self.probe.category, &self.probe.name);
         let duration_ms = self.start.elapsed().as_secs_f64() * 1000.0;
         let scripts_on = self.provider.control.has_scripts();
         if !scripts_on && !should_record(&self.probe, duration_ms) {
@@ -784,6 +793,9 @@ impl<'a> Drop for SpanGuard<'a> {
         if self.finished || !is_enabled() {
             return;
         }
+        self.provider
+            .control
+            .note_emitted(&self.probe.category, &self.probe.name);
         let duration_ms = self.start.elapsed().as_secs_f64() * 1000.0;
         let scripts_on = self.provider.control.has_scripts();
         if !scripts_on && !should_record(&self.probe, duration_ms) {
