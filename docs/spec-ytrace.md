@@ -105,7 +105,7 @@ $XDG_DATA_HOME/ytrace/<app>/ytrace.g<ts_ms>.jsonl   # generations
 ```
 
 * Generational retention (copied from `yggterm-core::retention`): `live_max_bytes` + `generations_max_bytes` + `max_age_ms`. Prune only at rotation + first write per process — one append per event, no scan.
-* Budget is **per app HOME while write rate is per process**: window ≈ `budget / (per-process rate × N)`. Size the budget in **bytes at the observed rate**, never in days.
+* Budget is **per app HOME while write rate is per process**: window ≈ `budget / (per-process rate × N)`. Size the budget in **bytes at the observed rate**, never in days. The non-dev generations ceiling is **4 GiB** (0.2.3): at the observed ~40 KB/s drumbeat, the old 1 GiB held only ~7 h of window — the morning's evidence was pruned by the evening, and the forensic window is the asset the budget exists to keep.
 
 ### 5.2 Live socket (optional, for `snapshot`/` tenants` style queries)
 

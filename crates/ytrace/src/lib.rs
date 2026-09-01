@@ -98,7 +98,7 @@ pub struct Retention {
 
 pub const DEFAULT_RETENTION: Retention = Retention {
     live_max_bytes: 8 * 1024 * 1024,
-    generations_max_bytes: 1024 * 1024 * 1024,
+    generations_max_bytes: 4 * 1024 * 1024 * 1024,
     max_age_ms: DEFAULT_MAX_AGE_MS,
 };
 
@@ -125,7 +125,13 @@ fn default_retention() -> Retention {
     let generations_max_bytes = if is_dev_mode() {
         10 * 1024 * 1024 * 1024
     } else {
-        1024 * 1024 * 1024
+        // 4 GiB — sized at the OBSERVED rate (2026-09-01, the GUI host): the
+        // record drumbeat averages ~40 KB/s, so 1 GiB held only ~7 h of
+        // window and the morning's evidence was pruned by the evening — the
+        // forensic window is the diagnostic asset the budget exists to keep.
+        // The files live on disk (the data home), not tmpfs; 4 GiB is noise
+        // next to the window it buys.
+        4 * 1024 * 1024 * 1024
     };
     Retention {
         live_max_bytes: 8 * 1024 * 1024,
