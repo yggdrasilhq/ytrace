@@ -96,7 +96,7 @@ All other probes are always recorded. Both parameters are per-probe and overrida
 
 ## 5. Transport — file first, socket second
 
-### 5.1 File (historical, always available)
+### 5.1 File plane (historical log, always available)
 
 ```
 $XDG_DATA_HOME/ytrace/<app>/ytrace.jsonl            # live
@@ -104,16 +104,21 @@ $XDG_DATA_HOME/ytrace/<app>/ytrace.g<ts_ms>.jsonl   # generations
 ~/.yggterm/ytrace/<app>/ytrace.jsonl                # legacy alias for yggterm (compat)
 ```
 
-* Generational retention (copied from `yggterm-core::retention`): `live_max_bytes` + `generations_max_bytes` + `max_age_ms`. Prune only at rotation + first write per process — one append per event, no scan.
+* The file plane is the durable log: every accepted sampled event is appended
+  as JSONL and remains queryable after the emitting process exits. Generational
+  retention has three explicit limits: `live_max_bytes` (100 MiB per app's
+  current file), `generations_max_bytes` (4 GiB in non-dev mode), and
+  `max_age_ms` (a 3-day ceiling). Prune only at rotation + first write per
+  process — one append per event, no scan.
 * Budget is **per app HOME while write rate is per process**: window ≈ `budget / (per-process rate × N)`. Size the budget in **bytes at the observed rate**, never in days. The non-dev generations ceiling is **4 GiB** (0.2.3): at the observed ~40 KB/s drumbeat, the old 1 GiB held only ~7 h of window — the morning's evidence was pruned by the evening, and the forensic window is the asset the budget exists to keep.
 
-### 5.2 Live socket (optional, for `snapshot`/` tenants` style queries)
+### 5.2 Live control plane (optional, for dynamic DTrace-like scripts and snapshots)
 
 ```
 $XDG_RUNTIME_DIR/ytrace/<app>-<pid>.sock
 ```
 
-* JSON request/response over Unix socket (`{"verb":"snapshot"}` → `{"v":1, ...}`), versioned. Absence is not an error — file transport already carries the history.
+* JSON request/response over Unix socket (`{"verb":"snapshot"}` → `{"v":1, ...}`), versioned. The same socket accepts runtime-attached scripts (`attach`), aggregate reads (`drain`), and removal (`detach`) against a process that is already running; no rebuild or restart is required. Absence is not an error — file transport already carries the history.
 * **One socket per (app, pid) — never one per Provider.** A process may build
   many Providers; they all join one control plane via `control::acquire`. The
   first binds; joiners share the engine by `Arc`. A Provider that called

@@ -88,6 +88,10 @@ fn now_ms() -> u128 {
 // ── retention (generational, from yggterm-core::retention, trimmed) ─────────
 
 pub const DEFAULT_MAX_AGE_MS: u128 = 3 * 24 * 60 * 60 * 1000; // 3 days ceiling
+/// Per-app live JSONL budget before rotation. Generations carry the longer
+/// forensic window; this budget keeps the current file bounded without
+/// turning the live stream into a short, lossy sample.
+pub const DEFAULT_LIVE_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Retention {
@@ -97,7 +101,7 @@ pub struct Retention {
 }
 
 pub const DEFAULT_RETENTION: Retention = Retention {
-    live_max_bytes: 8 * 1024 * 1024,
+    live_max_bytes: DEFAULT_LIVE_MAX_BYTES,
     generations_max_bytes: 4 * 1024 * 1024 * 1024,
     max_age_ms: DEFAULT_MAX_AGE_MS,
 };
@@ -134,7 +138,7 @@ fn default_retention() -> Retention {
         4 * 1024 * 1024 * 1024
     };
     Retention {
-        live_max_bytes: 8 * 1024 * 1024,
+        live_max_bytes: DEFAULT_LIVE_MAX_BYTES,
         generations_max_bytes,
         max_age_ms: DEFAULT_MAX_AGE_MS,
     }
@@ -852,6 +856,13 @@ pub mod control;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_live_log_budget_is_one_hundred_mebibytes() {
+        assert_eq!(DEFAULT_LIVE_MAX_BYTES, 100 * 1024 * 1024);
+        assert_eq!(DEFAULT_RETENTION.live_max_bytes, DEFAULT_LIVE_MAX_BYTES);
+        assert_eq!(default_retention().live_max_bytes, DEFAULT_LIVE_MAX_BYTES);
+    }
 
     /// The audit's end-to-end shape, at the Provider level: four yggterm-style
     /// providers, one process, one app — ONE control plane, one socket, one
