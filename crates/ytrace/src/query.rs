@@ -3,7 +3,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Hard cap on records a collector may hold. The scan streams one record at a
+/// time; this bounds only the OUTPUT side (an incident list, a tail window).
+/// 50k records at ~1-2 kB parsed each is tens of MB — flat regardless of how
+/// much history the corpus retains. Before this existed, every verb
+/// materialized its whole input window first (measured 4.0 GiB peak RSS for a
+/// single wide `query` on an 82 MB corpus — the machine-killer of 2026-09-09).
+pub const MAX_COLLECTED_RECORDS: usize = 50_000;
+
+/// Per-probe duration sample cap behind the percentiles. Counts, totals and
+/// max are EXACT over the whole window; p50/p95 above this many samples are
+/// reservoir-sampled (uniform, deterministic) — honest to well under a
+/// percentile point at 4k samples, and the memory per probe stops growing.
+const RESERVOIR_CAP: usize = 4096;
 
 /// Summary of one probe kind, like `server perf-summary`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,22 +45,170 @@ pub struct TimeseriesBucket {
     pub incident_count: u64,
 }
 
+/// Bounded uniform sample of one probe's durations (Algorithm R, deterministic
+/// so two runs over the same corpus agree).
+struct Reservoir {
+    buf: Vec<f64>,
+    seen: u64,
+}
+
+impl Reservoir {
+    fn new() -> Self {
+        Reservoir {
+            buf: Vec::new(),
+            seen: 0,
+        }
+    }
+
+    fn observe(&mut self, x: f64) {
+        self.seen += 1;
+        if self.buf.len() < RESERVOIR_CAP {
+            self.buf.push(x);
+            return;
+        }
+        // SplitMix-style scramble of the arrival index — sampling quality is
+        // irrelevant here, determinism and uniformity-over-the-window matter.
+        let mut z = self.seen.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        let idx = ((z ^ (z >> 31)) % self.seen) as usize;
+        if idx < RESERVOIR_CAP {
+            self.buf[idx] = x;
+        }
+    }
+
+    fn sorted(&self) -> Vec<f64> {
+        let mut v = self.buf.clone();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        v
+    }
+}
+
+// ── the scan primitive ──────────────────────────────────────────────────────
+//
+// Every reader verb is a fold over the records in a window. The fold used to
+// be spelled "collect everything into a Vec, then think" — which made every
+// verb's peak memory O(window corpus parsed) and turned the retention raises
+// (8 MiB -> 100 MiB live, 1 -> 4 GiB generations) into a fleet-killer. The
+// scan below is the ONLY thing allowed to read trace files: one line, one
+// parse, one hand-off, nothing retained. Filtering happens before the
+// hand-off; collectors keep only what their output needs.
+
+/// Visitor verdict: `Stop` ends the whole scan early (output cap reached).
+#[derive(Clone, Copy, PartialEq)]
+enum Flow {
+    Keep,
+    Stop,
+}
+
+fn scan_file(
+    path: &Path,
+    since_ms: Option<u128>,
+    f: &mut dyn FnMut(YtraceRecord) -> Flow,
+) -> bool {
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    for line in BufReader::new(file).lines().flatten() {
+        let parsed = match serde_json::from_str::<YtraceRecord>(&line) {
+            Ok(r) => Some(r),
+            Err(_) => serde_json::from_str::<Value>(&line)
+                .ok()
+                // try compat: yggterm perf/event trace shape
+                .and_then(|v| crate::compat::try_from_yggterm_value(&v)),
+        };
+        let Some(r) = parsed else { continue };
+        if let Some(since) = since_ms {
+            if r.ts_ms < since {
+                continue;
+            }
+        }
+        if f(r) == Flow::Stop {
+            return true;
+        }
+    }
+    false
+}
+
+/// Generations of `home` whose rotation stamp is at/after `floor`, any order.
+/// A generation named `ytrace.g<ts>.jsonl` was rotated at `ts` and therefore
+/// holds only records OLDER than `ts` — one whose ts predates the window floor
+/// cannot contain a record inside the window, so it is skippable without
+/// reading. Without this, the query tool's cost grows with the whole retained
+/// history (the byte budget exists to bound the window, not to invite
+/// re-reading all of it every query).
+fn in_window_generations(home: &Path, since_ms: Option<u128>) -> Vec<(u128, PathBuf)> {
+    let mut gens: Vec<(u128, PathBuf)> = Vec::new();
+    if let Ok(entries) = fs::read_dir(home) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if let Some(rest) = name
+                .strip_prefix("ytrace.g")
+                .and_then(|r| r.strip_suffix(".jsonl"))
+            {
+                if let Ok(gen_ts) = rest.parse::<u128>() {
+                    if since_ms.is_some_and(|floor| gen_ts < floor) {
+                        continue;
+                    }
+                    gens.push((gen_ts, e.path()));
+                }
+            }
+        }
+    }
+    gens
+}
+
+/// Fold every record in the window through `f`. Returns true when `f` stopped
+/// the scan early. Record order is UNSPECIFIED — order-sensitive collectors
+/// (tail) must use the newest-first scan below.
+fn for_each_record(
+    home: &Path,
+    since_ms: Option<u128>,
+    f: &mut dyn FnMut(YtraceRecord) -> Flow,
+) -> bool {
+    // `since_ms` is an absolute epoch. A duration here compiles and silently
+    // widens the query to all of history, which reads as a plausible number
+    // rather than an error — see the note above `EPOCH_FLOOR_MS`.
+    debug_assert!(
+        !since_ms.is_some_and(looks_like_duration),
+        "ytrace::query: since_ms={:?} is duration-shaped, not an epoch. \
+         Use query::since_window(Duration) — or rate_per_min() if you want a rate.",
+        since_ms
+    );
+    let live = home.join("ytrace.jsonl");
+    if scan_file(&live, since_ms, f) {
+        return true;
+    }
+    for (_, path) in in_window_generations(home, since_ms) {
+        if scan_file(&path, since_ms, f) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Summarize a ytrace file (live + generations) since `since_ms`.
 ///
 /// `since_ms` is an ABSOLUTE epoch-millisecond floor, not a duration. For
 /// "the last N", pass [`since_window`]; for a rate, prefer [`rate_per_min`],
 /// which cannot be handed the wrong one.
+///
+/// Streams: one record resident at a time. Counts/totals/max are exact;
+/// percentiles above [`RESERVOIR_CAP`] samples per probe are reservoir-sampled.
 pub fn summarize(home: &Path, category_filter: Option<&str>, since_ms: Option<u128>) -> Vec<ProbeSummary> {
-    let mut records = Vec::new();
-    collect_records(home, since_ms, &mut records);
-    let mut by_probe_durs: std::collections::BTreeMap<(String, String, String), Vec<f64>> = std::collections::BTreeMap::new();
-    let mut by_probe_counts: std::collections::BTreeMap<(String, String, String), u64> = std::collections::BTreeMap::new();
-    let mut app_by_probe: std::collections::HashMap<(String, String, String), String> = std::collections::HashMap::new();
-
-    for r in records {
+    struct Agg {
+        app: String,
+        count: u64,
+        total_ms: f64,
+        max_ms: f64,
+        durs: Reservoir,
+    }
+    let mut by_probe: std::collections::HashMap<(String, String, String), Agg> =
+        std::collections::HashMap::new();
+    for_each_record(home, since_ms, &mut |r: YtraceRecord| {
         if let Some(cat) = category_filter {
             if r.category != cat {
-                continue;
+                return Flow::Keep;
             }
         }
         let clock = if r.duration_ms.is_some() {
@@ -54,44 +216,43 @@ pub fn summarize(home: &Path, category_filter: Option<&str>, since_ms: Option<u1
         } else {
             "point".to_string()
         };
-        let key = (r.category.clone(), r.name.clone(), clock);
-        *by_probe_counts.entry(key.clone()).or_default() += 1;
-        if let Some(dur) = r.duration_ms {
-            by_probe_durs.entry(key.clone()).or_default().push(dur);
-        }
-        app_by_probe.entry(key).or_insert(r.app.clone());
-    }
-
-    let mut out = Vec::new();
-    for ((category, name, clock), count) in by_probe_counts {
-        let is_span = by_probe_durs.contains_key(&(category.clone(), name.clone(), clock.clone()));
-        let (total_ms, p50_ms, p95_ms, max_ms) = if let Some(mut durs) = by_probe_durs.remove(&(category.clone(), name.clone(), clock.clone())) {
-            durs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let tot: f64 = durs.iter().sum();
-            let p50 = percentile(&durs, 0.5);
-            let p95 = percentile(&durs, 0.95);
-            let max = durs.last().copied().unwrap_or(0.0);
-            (tot, p50, p95, max)
-        } else {
-            (0.0, 0.0, 0.0, 0.0)
-        };
-        let app = app_by_probe
-            .get(&(category.clone(), name.clone(), clock.clone()))
-            .cloned()
-            .unwrap_or_default();
-        out.push(ProbeSummary {
-            app,
-            category,
-            name,
-            clock,
-            is_span,
-            count,
-            total_ms,
-            p50_ms,
-            p95_ms,
-            max_ms,
+        let key = (r.category, r.name, clock);
+        let agg = by_probe.entry(key).or_insert_with(|| Agg {
+            app: r.app.clone(),
+            count: 0,
+            total_ms: 0.0,
+            max_ms: 0.0,
+            durs: Reservoir::new(),
         });
-    }
+        agg.count += 1;
+        if let Some(dur) = r.duration_ms {
+            agg.total_ms += dur;
+            if dur > agg.max_ms {
+                agg.max_ms = dur;
+            }
+            agg.durs.observe(dur);
+        }
+        Flow::Keep
+    });
+
+    let mut out: Vec<ProbeSummary> = by_probe
+        .into_iter()
+        .map(|((category, name, clock), agg)| {
+            let sorted = agg.durs.sorted();
+            ProbeSummary {
+                app: agg.app,
+                is_span: !sorted.is_empty(),
+                category,
+                name,
+                clock,
+                count: agg.count,
+                total_ms: agg.total_ms,
+                p50_ms: percentile(&sorted, 0.5),
+                p95_ms: percentile(&sorted, 0.95),
+                max_ms: agg.max_ms,
+            }
+        })
+        .collect();
     out.sort_by(|a, b| {
         b.total_ms
             .partial_cmp(&a.total_ms)
@@ -103,10 +264,8 @@ pub fn summarize(home: &Path, category_filter: Option<&str>, since_ms: Option<u1
 
 /// Produce folded stacks for flamegraphs: `app;component;category;name <sample_value>`
 pub fn flamegraph_folded(home: &Path, since_ms: Option<u128>, by_wall_time: bool) -> Vec<(String, u64)> {
-    let mut records = Vec::new();
-    collect_records(home, since_ms, &mut records);
     let mut stacks: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    for r in records {
+    for_each_record(home, since_ms, &mut |r: YtraceRecord| {
         let stack = format!("{app};{comp};{cat};{name}",
             app = if r.app.is_empty() { "yggterm" } else { &r.app },
             comp = if r.component.is_empty() { "core" } else { &r.component },
@@ -119,55 +278,77 @@ pub fn flamegraph_folded(home: &Path, since_ms: Option<u128>, by_wall_time: bool
             1
         };
         *stacks.entry(stack).or_default() += val;
-    }
+        Flow::Keep
+    });
     let mut out: Vec<_> = stacks.into_iter().collect();
     out.sort_by(|a, b| b.1.cmp(&a.1));
     out
 }
 
 /// Generate bucketed timeseries for telemetry trends
+///
+/// Streams: per-bucket aggregates only, so a 1 s bucket over a month of
+/// history holds buckets, never records. Interior buckets with no events are
+/// emitted as zeros, same as the collect-first shape did.
 pub fn timeseries(home: &Path, bucket_ms: u128, since_ms: Option<u128>) -> Vec<TimeseriesBucket> {
-    let mut records = Vec::new();
-    collect_records(home, since_ms, &mut records);
-    records.sort_by_key(|r| r.ts_ms);
-
-    if records.is_empty() {
-        return Vec::new();
-    }
     let bucket_ms = bucket_ms.max(1000);
-    let first_ts = records.first().map(|r| r.ts_ms).unwrap_or(0);
-    let last_ts = records.last().map(|r| r.ts_ms).unwrap_or(0);
-
-    let mut buckets: std::collections::BTreeMap<u128, Vec<&YtraceRecord>> = std::collections::BTreeMap::new();
-    let mut cur = (first_ts / bucket_ms) * bucket_ms;
-    while cur <= last_ts {
-        buckets.insert(cur, Vec::new());
-        cur += bucket_ms;
+    struct BucketAgg {
+        count: u64,
+        total_ms: f64,
+        incidents: u64,
+        durs: Reservoir,
     }
-
-    for r in &records {
+    let mut buckets: std::collections::BTreeMap<u128, BucketAgg> = std::collections::BTreeMap::new();
+    for_each_record(home, since_ms, &mut |r: YtraceRecord| {
         let b_start = (r.ts_ms / bucket_ms) * bucket_ms;
-        buckets.entry(b_start).or_default().push(r);
-    }
+        let agg = buckets.entry(b_start).or_insert_with(|| BucketAgg {
+            count: 0,
+            total_ms: 0.0,
+            incidents: 0,
+            durs: Reservoir::new(),
+        });
+        agg.count += 1;
+        if let Some(dur) = r.duration_ms {
+            agg.total_ms += dur;
+            agg.durs.observe(dur);
+        }
+        if r.payload.get("incident").and_then(|v| v.as_bool()).unwrap_or(false) {
+            agg.incidents += 1;
+        }
+        Flow::Keep
+    });
 
     let mut out = Vec::new();
-    for (start, recs) in buckets {
-        let count = recs.len() as u64;
-        let mut durs: Vec<f64> = recs.iter().filter_map(|r| r.duration_ms).collect();
-        durs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let span_count = durs.len() as u64;
-        let total_duration_ms: f64 = durs.iter().sum();
-        let p95_ms = percentile(&durs, 0.95);
-        let incident_count = recs.iter().filter(|r| r.payload.get("incident").and_then(|v| v.as_bool()).unwrap_or(false)).count() as u64;
-        out.push(TimeseriesBucket {
-            bucket_start_ms: start,
-            bucket_end_ms: start + bucket_ms,
-            count,
-            span_count,
-            total_duration_ms,
-            p95_ms,
-            incident_count,
-        });
+    let mut next_start = match buckets.keys().next() {
+        Some(k) => *k,
+        None => return out,
+    };
+    let last_start = *buckets.keys().next_back().unwrap();
+    while next_start <= last_start {
+        match buckets.remove(&next_start) {
+            Some(agg) => {
+                let sorted = agg.durs.sorted();
+                out.push(TimeseriesBucket {
+                    bucket_start_ms: next_start,
+                    bucket_end_ms: next_start + bucket_ms,
+                    count: agg.count,
+                    span_count: agg.durs.seen,
+                    total_duration_ms: agg.total_ms,
+                    p95_ms: percentile(&sorted, 0.95),
+                    incident_count: agg.incidents,
+                });
+            }
+            None => out.push(TimeseriesBucket {
+                bucket_start_ms: next_start,
+                bucket_end_ms: next_start + bucket_ms,
+                count: 0,
+                span_count: 0,
+                total_duration_ms: 0.0,
+                p95_ms: 0.0,
+                incident_count: 0,
+            }),
+        }
+        next_start += bucket_ms;
     }
     out
 }
@@ -180,62 +361,80 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
-pub fn tail(home: &Path, n: usize, since_ms: Option<u128>) -> Vec<YtraceRecord> {
-    let mut records = Vec::new();
-    collect_records(home, since_ms, &mut records);
-    records.sort_by_key(|r| r.ts_ms);
-    if records.len() > n {
-        records.split_off(records.len() - n)
-    } else {
-        records
-    }
-}
-
-fn collect_records(home: &Path, since_ms: Option<u128>, out: &mut Vec<YtraceRecord>) {
-    // `since_ms` is an absolute epoch. A duration here compiles and silently
-    // widens the query to all of history, which reads as a plausible number
-    // rather than an error — see the note above `EPOCH_FLOOR_MS`.
-    debug_assert!(
-        !since_ms.is_some_and(looks_like_duration),
-        "ytrace::query: since_ms={:?} is duration-shaped, not an epoch. \
-         Use query::since_window(Duration) — or rate_per_min() if you want a rate.",
-        since_ms
-    );
+/// Last `n` records in the window, optionally filtered by category.
+///
+/// O(n) memory: a ring over a NEWEST-FIRST file walk. Files are strictly
+/// time-ordered across each other — every record in a generation is older
+/// than every record in the generation rotated after it, and older than
+/// everything in the live file — so once the ring holds `n` records and a
+/// file has been fully consumed, every unread file can only hold records
+/// older than the ring. No full-window collect, no sort of the corpus.
+pub fn tail_where(
+    home: &Path,
+    n: usize,
+    since_ms: Option<u128>,
+    category: Option<&str>,
+) -> Vec<YtraceRecord> {
+    let n = n.min(MAX_COLLECTED_RECORDS).max(1);
+    // The n-newest selector: keyed by (ts, arrival seq) so eviction always
+    // removes the oldest record regardless of which file it came from. A
+    // naive drop-front ring is wrong here — a record arriving from an older
+    // generation lands after newer live records and would evict the wrong
+    // end (caught by tail_reads_the_newest_n_without_collecting_the_corpus).
+    let mut sel: std::collections::BTreeMap<(u128, u64), YtraceRecord> =
+        std::collections::BTreeMap::new();
+    let mut seq: u64 = 0;
+    let push = |sel: &mut std::collections::BTreeMap<(u128, u64), YtraceRecord>,
+                    seq: &mut u64,
+                    r: YtraceRecord| {
+        if let Some(cat) = category {
+            if r.category != cat {
+                return Flow::Keep;
+            }
+        }
+        *seq += 1;
+        sel.insert((r.ts_ms, *seq), r);
+        if sel.len() > n {
+            sel.pop_first();
+        }
+        Flow::Keep
+    };
     let live = home.join("ytrace.jsonl");
-    read_one(&live, since_ms, out);
-    // generations. A generation named `ytrace.g<ts>.jsonl` was rotated at `ts`
-    // and therefore holds only records OLDER than `ts` — a generation whose ts
-    // predates the window floor cannot contain a record inside the window, so
-    // it is skippable without reading. Without this, the query tool's cost
-    // grows with the whole retained history (the byte budget exists to bound
-    // the window, not to invite re-reading all of it every query).
-    if let Ok(entries) = fs::read_dir(home) {
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if let Some(rest) = name
-                .strip_prefix("ytrace.g")
-                .and_then(|r| r.strip_suffix(".jsonl"))
-            {
-                if let Ok(gen_ts) = rest.parse::<u128>() {
-                    if since_ms.is_some_and(|floor| gen_ts < floor) {
-                        continue;
-                    }
-                }
-                read_one(&e.path(), since_ms, out);
+    scan_file(&live, since_ms, &mut |r| push(&mut sel, &mut seq, r));
+    if sel.len() < n {
+        let mut gens = in_window_generations(home, since_ms);
+        gens.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, path) in gens {
+            scan_file(&path, since_ms, &mut |r| push(&mut sel, &mut seq, r));
+            if sel.len() >= n {
+                break;
             }
         }
     }
+    let v: Vec<YtraceRecord> = sel.into_values().collect();
+    v
+}
+
+pub fn tail(home: &Path, n: usize, since_ms: Option<u128>) -> Vec<YtraceRecord> {
+    tail_where(home, n, since_ms, None)
 }
 
 /// All incidents since `since_ms` — an ABSOLUTE epoch-ms floor, see [`since_window`].
-/// (Records where payload.incident == true.)
+/// (Records where payload.incident == true.) Filtered during the scan; capped
+/// at [`MAX_COLLECTED_RECORDS`].
 pub fn incidents(home: &Path, since_ms: Option<u128>) -> Vec<YtraceRecord> {
-    let mut records = Vec::new();
-    collect_records(home, since_ms, &mut records);
-    records
-        .into_iter()
-        .filter(|r| r.payload.get("incident").and_then(|v| v.as_bool()).unwrap_or(false))
-        .collect()
+    let mut out = Vec::new();
+    for_each_record(home, since_ms, &mut |r: YtraceRecord| {
+        if !r.payload.get("incident").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Flow::Keep;
+        }
+        if out.len() >= MAX_COLLECTED_RECORDS {
+            return Flow::Stop;
+        }
+        out.push(r);
+        Flow::Keep
+    });
+    out
 }
 
 /// Health summary — incident counts and hottest probes for an LLM complaint view.
@@ -263,32 +462,6 @@ pub fn health(home: &Path, since_ms: Option<u128>) -> HealthSummary {
         warn,
         error,
         probes,
-    }
-}
-
-fn read_one(path: &Path, since_ms: Option<u128>, out: &mut Vec<YtraceRecord>) {
-    let Ok(f) = fs::File::open(path) else {
-        return;
-    };
-    for line in BufReader::new(f).lines().flatten() {
-        if let Ok(r) = serde_json::from_str::<YtraceRecord>(&line) {
-            if let Some(since) = since_ms {
-                if r.ts_ms < since {
-                    continue;
-                }
-            }
-            out.push(r);
-        } else if let Ok(v) = serde_json::from_str::<Value>(&line) {
-            // try compat: yggterm perf/event trace shape
-            if let Some(r) = crate::compat::try_from_yggterm_value(&v) {
-                if let Some(since) = since_ms {
-                    if r.ts_ms < since {
-                        continue;
-                    }
-                }
-                out.push(r);
-            }
-        }
     }
 }
 
@@ -391,29 +564,39 @@ mod window_tests {
     use super::*;
     use std::time::Duration;
 
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ytrace-{}-{}", tag, std::process::id()));
+        let home = dir.join("app");
+        let _ = fs::create_dir_all(&home);
+        dir
+    }
+
+    fn mk(cat: &str, ts: u128, dur: Option<f64>) -> String {
+        let d = match dur {
+            Some(d) => format!(r#""duration_ms":{d},"#),
+            None => String::new(),
+        };
+        format!(
+            "{{\"v\":1,\"ts_ms\":{ts},\"pid\":1,\"app\":\"a\",\"app_version\":\"0\",\"component\":\"c\",{d}\"category\":\"{cat}\",\"name\":\"n\",\"clock\":\"wall\",\"payload\":{{}}}}\n"
+        )
+    }
+
     #[test]
     fn summarize_skips_generations_entirely_outside_the_window() {
         // regression: the query tool's cost grew with ALL retained history —
         // 152 generations (~350MB) scanned for a small window. A generation
         // rotated before the floor provably holds no in-window record.
-        let dir = std::env::temp_dir().join(format!("ytrace-query-skip-{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
+        let dir = scratch("skip");
         let home = dir.join("app");
-        let _ = fs::create_dir_all(&home);
         let floor = 1_700_000_000_000u128; // epoch-shaped, not duration-shaped
-        let mk = |cat: &str, ts: u128| {
-            format!(
-                "{{\"v\":1,\"ts_ms\":{ts},\"pid\":1,\"app\":\"a\",\"app_version\":\"0\",\"component\":\"c\",\"category\":\"{cat}\",\"name\":\"n\",\"clock\":\"wall\",\"payload\":{{}}}}\n"
-            )
-        };
         // rotated long before the floor: must be skipped without parsing.
         // The record inside carries an IN-WINDOW timestamp — if the skip is
         // ever removed, this record resurfaces and the test fails.
-        fs::write(home.join("ytrace.g1699999000000.jsonl"), mk("old", floor + 100)).unwrap();
+        fs::write(home.join("ytrace.g1699999000000.jsonl"), mk("old", floor + 100, None)).unwrap();
         // rotated after the floor: scanned normally
         fs::write(
             home.join(format!("ytrace.g{}.jsonl", floor + 500)),
-            mk("new", floor + 100),
+            mk("new", floor + 100, None),
         )
         .unwrap();
         let sums = summarize(&home, None, Some(floor));
@@ -471,5 +654,146 @@ mod window_tests {
         assert_eq!(r.count, 0);
         assert_eq!(r.per_min, 0.0);
         assert_eq!(r.window, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn tail_reads_the_newest_n_without_collecting_the_corpus() {
+        // two generations + live; the newest records live in the live file.
+        let dir = scratch("tail");
+        let home = dir.join("app");
+        let base = 1_700_000_000_000u128;
+        fs::write(
+            home.join(format!("ytrace.g{}.jsonl", base + 1000)),
+            format!("{}{}", mk("old", base + 10, None), mk("old", base + 20, None)),
+        )
+        .unwrap();
+        fs::write(
+            home.join("ytrace.jsonl"),
+            format!(
+                "{}{}{}{}",
+                mk("live", base + 1010, None),
+                mk("live", base + 1020, None),
+                mk("live", base + 1030, None),
+                mk("live", base + 1040, None)
+            ),
+        )
+        .unwrap();
+        // n smaller than the live file: everything must come from live, newest last.
+        let t2 = tail(&home, 2, None);
+        assert_eq!(t2.len(), 2);
+        assert!(t2.iter().all(|r| r.category == "live"), "tail(2) mixed old generations in: {t2:?}");
+        assert_eq!(t2[1].ts_ms, base + 1040);
+        // n larger than live: tops up from the NEWEST generation only.
+        let t5 = tail(&home, 5, None);
+        assert_eq!(t5.len(), 5);
+        assert_eq!(t5.first().unwrap().ts_ms, base + 20, "oldest of the newest five");
+        assert_eq!(t5.last().unwrap().ts_ms, base + 1040);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tail_where_filters_during_the_scan_not_after() {
+        let dir = scratch("tailwhere");
+        let home = dir.join("app");
+        let base = 1_700_000_000_000u128;
+        let mut body = String::new();
+        for i in 0..50 {
+            body.push_str(&mk(if i % 2 == 0 { "ui" } else { "other" }, base + i, None));
+        }
+        fs::write(home.join("ytrace.jsonl"), body).unwrap();
+        let got = tail_where(&home, 3, None, Some("ui"));
+        assert_eq!(got.len(), 3);
+        assert!(got.iter().all(|r| r.category == "ui"));
+        // the three NEWEST ui records: indices 48, 46, 44 — newest last
+        assert_eq!(got[2].ts_ms, base + 48);
+        assert_eq!(got[0].ts_ms, base + 44);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn summarize_stays_exact_on_counts_while_sampling_durations() {
+        let dir = scratch("reservoir");
+        let home = dir.join("app");
+        let base = 1_700_000_000_000u128;
+        let mut body = String::new();
+        // 10k spans, duration i — exact count and total must survive sampling.
+        for i in 0..10_000u128 {
+            body.push_str(&mk("ui", base + i, Some(i as f64)));
+        }
+        fs::write(home.join("ytrace.jsonl"), body).unwrap();
+        let sums = summarize(&home, None, None);
+        assert_eq!(sums.len(), 1);
+        let s = &sums[0];
+        assert_eq!(s.count, 10_000, "count is exact regardless of the reservoir");
+        assert_eq!(s.max_ms, 9999.0, "max is exact");
+        assert_eq!(s.total_ms, (0..10_000u128).map(|i| i as f64).sum::<f64>());
+        assert_eq!(s.is_span, true);
+        // p50 of 0..9999 ≈ 5000; a uniform reservoir lands within a few percent.
+        assert!((4_500.0..=5_500.0).contains(&s.p50_ms), "p50 drifted: {}", s.p50_ms);
+        assert!((9_300.0..=10_700.0).contains(&s.p95_ms), "p95 drifted: {}", s.p95_ms);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incidents_filter_during_scan_and_carry_the_cap() {
+        let dir = scratch("incidents");
+        let home = dir.join("app");
+        let base = 1_700_000_000_000u128;
+        let mut body = String::new();
+        for i in 0..100u128 {
+            let payload = if i % 10 == 0 {
+                r#""incident":true"#
+            } else {
+                r#""incident":false"#
+            };
+            body.push_str(&format!(
+                "{{\"v\":1,\"ts_ms\":{},\"pid\":1,\"app\":\"a\",\"app_version\":\"0\",\"component\":\"c\",\"category\":\"ui\",\"name\":\"n\",\"clock\":\"wall\",\"payload\":{{{}}}}}\n",
+                base + i, payload
+            ));
+        }
+        fs::write(home.join("ytrace.jsonl"), body).unwrap();
+        let got = incidents(&home, None);
+        assert_eq!(got.len(), 10, "only incidents survive the scan");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn timeseries_emits_zero_rows_for_quiet_interior_buckets() {
+        let dir = scratch("timeseries");
+        let home = dir.join("app");
+        let base = 1_700_000_000_000u128;
+        // two records one bucket-width apart in ms terms (bucket maxed to 1s)
+        fs::write(
+            home.join("ytrace.jsonl"),
+            format!("{}{}", mk("ui", base, Some(5.0)), mk("ui", base + 3_000, Some(7.0))),
+        )
+        .unwrap();
+        let series = timeseries(&home, 1_000, None);
+        assert_eq!(series.len(), 4, "buckets 0s,1s,2s,3s — quiet interiors included");
+        assert_eq!(series[0].count, 1);
+        assert_eq!(series[1].count, 0, "interior quiet bucket is a zero row");
+        assert_eq!(series[3].count, 1);
+        assert_eq!(series[3].total_duration_ms, 7.0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cap_stops_the_scan_not_the_machine() {
+        // More matching incidents than MAX_COLLECTED_RECORDS: the collector
+        // stops at the cap instead of holding the corpus.
+        let dir = scratch("cap");
+        let home = dir.join("app");
+        let base = 1_700_000_000_000u128;
+        let mut body = String::new();
+        for i in 0..(MAX_COLLECTED_RECORDS as u128 + 500) {
+            body.push_str(&format!(
+                "{{\"v\":1,\"ts_ms\":{},\"pid\":1,\"app\":\"a\",\"app_version\":\"0\",\"component\":\"c\",\"category\":\"ui\",\"name\":\"n\",\"clock\":\"wall\",\"payload\":{{\"incident\":true}}}}\n",
+                base + i
+            ));
+        }
+        fs::write(home.join("ytrace.jsonl"), body).unwrap();
+        let got = incidents(&home, None);
+        assert_eq!(got.len(), MAX_COLLECTED_RECORDS, "capped, not unbounded");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

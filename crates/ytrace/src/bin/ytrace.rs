@@ -19,7 +19,7 @@ enum Commands {
         category: Option<String>,
         #[arg(long)]
         name: Option<String>,
-        /// e.g. 60s, 5m, 1h, 15s — or raw ms number.
+        /// e.g. 60s, 5m, 1h, 15s — a raw ms window, or an absolute epoch-ms.
         #[arg(long)]
         since: Option<String>,
         #[arg(long, default_value_t = 50)]
@@ -175,8 +175,16 @@ fn parse_since(s: &str) -> Option<u128> {
     if s.is_empty() {
         return None;
     }
-    // bare number => ms
     if let Ok(ms) = s.parse::<u128>() {
+        // A bare number has two natural readings and only one is safe to
+        // guess: at/above the epoch floor it IS an absolute epoch-ms (the
+        // spelling every epoch-producing tool emits); below it, it can only
+        // be a relative window in ms. Guessing "relative" for an epoch sent
+        // the floor to 1970 and widened every query to all of recorded
+        // history — the 2026-09-09 machine-killer's trigger.
+        if ms >= ytrace::query::EPOCH_FLOOR_MS {
+            return Some(ms);
+        }
         let now = now_ms();
         return Some(now.saturating_sub(ms));
     }
@@ -298,20 +306,12 @@ fn main() -> Result<()> {
         } => {
             let home = resolve_home(&app);
             let since_ms = since.as_deref().and_then(parse_since);
-            // --lines N dominates; default 20
+            // --lines N dominates; default 20. The category filter rides the
+            // scan (a ring of the newest N MATCHING records) — filtering a
+            // collect-after-the-fact ring of 100k was a memory shape, not a
+            // query.
             let n = lines.unwrap_or(20);
-            let recs = if let Some(cat) = category {
-                let all = ytrace::query::tail(&home, 100_000, since_ms);
-                let mut filtered: Vec<_> = all.into_iter().filter(|r| r.category == cat).collect();
-                filtered.sort_by_key(|r| r.ts_ms);
-                if filtered.len() > n {
-                    filtered.split_off(filtered.len() - n)
-                } else {
-                    filtered
-                }
-            } else {
-                ytrace::query::tail(&home, n, since_ms)
-            };
+            let recs = ytrace::query::tail_where(&home, n, since_ms, category.as_deref());
             if json {
                 let out: Vec<serde_json::Value> =
                     recs.iter().map(|r| serde_json::to_value(r).unwrap()).collect();
@@ -723,4 +723,34 @@ fn watch_loop(sock: &Path, id: &str, every_secs: u64, reset: bool, json: bool) -
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod since_tests {
+    use super::*;
+
+    #[test]
+    fn an_absolute_epoch_ms_passes_through_untouched() {
+        // The 2026-09-09 machine-killer: this spelling used to be read as a
+        // relative window, sending the floor to 1970 and every query to ALL
+        // of recorded history (measured 4.0 GiB RSS for one invocation).
+        let epoch: u128 = 1_788_363_436_059;
+        assert_eq!(parse_since(&epoch.to_string()), Some(epoch));
+    }
+
+    #[test]
+    fn a_small_bare_number_is_still_a_relative_ms_window() {
+        let got = parse_since("300000").unwrap();
+        let now = now_ms();
+        assert!(got <= now && now - got <= 300_000 + 5_000, "got {got} vs now {now}");
+    }
+
+    #[test]
+    fn suffix_windows_are_relative_and_unchanged() {
+        let got = parse_since("5m").unwrap();
+        let now = now_ms();
+        assert!(now - got <= 300_000 + 5_000 && now - got >= 300_000 - 5_000);
+        assert_eq!(parse_since(""), None);
+        assert_eq!(parse_since("nonsense"), None);
+    }
 }
