@@ -170,6 +170,29 @@ Each provider every 15 s appends (or upserts in `registry.json` alternative) :
 
 Local only, in-process (`~/.local/share/ytrace/...`) so they answer even when the daemon is busy — same guarantee as `yggterm-headless server perf-summary`.
 
+### 6.1 Reader bounds — verbs stream, they never materialize the corpus (0.2.4)
+
+Every verb is a fold over the window, and the fold streams: one line, one
+parse, one hand-off, nothing retained beyond what the output needs. This is a
+contract, not an optimization — the byte budgets above bound the corpus on
+DISK, and a reader that materialized its input window would turn a bigger
+budget into a machine-killer (2026-09-09: one wide `query` peaked at 4.0 GiB
+RSS on an 82 MB corpus, five concurrent agent rituals at once — mem+swap both
+full, cold reset).
+
+* **Collectors are capped:** `tail`/`tail_where` hold at most `n` (the n
+  NEWEST, selected by `(ts, arrival)` order — cross-file timestamps are
+  strictly ordered by rotation, so the newest files win); `incidents` caps at
+  `MAX_COLLECTED_RECORDS` (50k). Aggregating verbs (`query`, `top`, `health`,
+  `flame`, `timeseries`) hold per-probe/per-bucket state only — never records.
+* **Percentiles are reservoir-sampled** above 4096 durations per probe
+  (deterministic). Counts, totals and max are EXACT at any volume; two runs
+  over the same corpus agree.
+* **`--since` accepts two spellings:** a suffix window (`60s`, `5m`, `1h`)
+  and an absolute epoch-ms. A bare number at/above `EPOCH_FLOOR_MS` is an
+  absolute epoch; below it, a relative ms window. Before 0.2.4 a bare number
+  was ALWAYS relative — an epoch silently queried all of recorded history.
+
 ---
 
 ## 7. Integration contract — 5 lines to become a provider
