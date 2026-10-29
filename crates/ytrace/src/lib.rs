@@ -884,6 +884,28 @@ mod tests {
         assert_eq!(default_retention().live_max_bytes, DEFAULT_LIVE_MAX_BYTES);
     }
 
+    #[test]
+    fn provider_rejoins_live_file_after_external_rotation() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = Provider::with_home("portable-rotation", "test", temp.path());
+        provider.event("test", "rotation", "before", serde_json::json!({}));
+        let path = temp.path().join("ytrace.jsonl");
+        let rotated = temp.path().join("rotated.jsonl");
+        fs::rename(&path, &rotated).unwrap();
+        fs::write(&path, "").unwrap();
+        {
+            let mut out = provider.out.lock().unwrap();
+            provider.rotation_check(&mut out.file, 0);
+        }
+        provider.event("test", "rotation", "after", serde_json::json!({}));
+        let active = fs::read_to_string(&path).unwrap();
+        let previous = fs::read_to_string(&rotated).unwrap();
+        assert!(active.contains("after"));
+        assert!(!active.contains("before"));
+        assert!(previous.contains("before"));
+        assert!(!previous.contains("after"));
+    }
+
     /// The audit's end-to-end shape, at the Provider level: four yggterm-style
     /// providers, one process, one app — ONE control plane, one socket, one
     /// catalogue (the union), and a script attached through provider A seeing
@@ -904,11 +926,22 @@ mod tests {
         p_gov.register("governor/fault", Clock::Wall, Sample::always());
         p_panic.register("host/panic", Clock::Wall, Sample::always());
 
-        // one socket for all four
-        let sock = p_trace.socket_path().expect("the first provider binds");
-        assert_eq!(p_perf.socket_path(), Some(sock));
-        assert_eq!(p_gov.socket_path(), Some(sock));
-        assert_eq!(p_panic.socket_path(), Some(sock));
+        // Unix advertises one socket; other platforms preserve the shared
+        // engine and file provider without claiming a live socket transport.
+        #[cfg(unix)]
+        {
+            let sock = p_trace.socket_path().expect("the first provider binds");
+            assert_eq!(p_perf.socket_path(), Some(sock));
+            assert_eq!(p_gov.socket_path(), Some(sock));
+            assert_eq!(p_panic.socket_path(), Some(sock));
+        }
+        #[cfg(not(unix))]
+        {
+            assert!(p_trace.socket_path().is_none());
+            assert!(p_perf.socket_path().is_none());
+            assert!(p_gov.socket_path().is_none());
+            assert!(p_panic.socket_path().is_none());
+        }
 
         // the catalogue is the UNION — what the registry now advertises
         let cat = p_perf.control().catalogue();

@@ -18,12 +18,14 @@
 use crate::script::{parse, RecRef, ScriptState};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+#[cfg(unix)]
 use std::time::Duration;
 
 pub const PROTOCOL_V: u8 = 1;
@@ -309,6 +311,7 @@ pub fn request(_sock: &Path, _req: &Value) -> Result<Value, String> {
     )
 }
 
+#[cfg(unix)]
 fn now_ms_fallback() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -474,6 +477,7 @@ fn handle_conn(stream: UnixStream, control: Arc<Control>) {
     }
 }
 
+#[cfg(unix)]
 fn route(control: &Control, req: &Value) -> Value {
     match req.get("verb").and_then(|v| v.as_str()) {
         Some("ping") => {
