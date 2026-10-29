@@ -293,9 +293,9 @@ impl Provider {
         // unlinked the previous live listener — its attached scripts became
         // unreachable and the registry's single (app,pid) row flipped its
         // catalogue to the last rebinder. `acquire` joins the first engine.
-        let (control, socket) = control::control_dir()
-            .map(|dir| control::acquire(&app, &dir, std::process::id()))
-            .unwrap_or_else(|| (Arc::new(control::Control::new(&app)), None));
+        let directory = control::control_dir();
+        let (control, socket) = control::acquire_optional(
+            &app, directory.as_deref(), std::process::id());
         Self {
             app,
             app_version: app_version.into(),
@@ -716,6 +716,10 @@ fn default_home(app: &str) -> PathBuf {
             .join("share")
             .join("ytrace")
             .join(app);
+    }
+    #[cfg(windows)]
+    if let Some(base) = dirs::data_local_dir() {
+        return base.join("ytrace").join(app);
     }
     PathBuf::from("/tmp/ytrace").join(app)
 }

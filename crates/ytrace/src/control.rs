@@ -365,13 +365,20 @@ struct SharedEntry {
 /// socket path (Some only for the engine that won the bind, but the SAME path
 /// is returned to joiners — the socket is one per process either way).
 pub fn acquire(app: &str, dir: &Path, pid: u32) -> (Arc<Control>, Option<PathBuf>) {
+    acquire_optional(app, Some(dir), pid)
+}
+
+/// Share the in-process engine even when no control directory is available.
+/// Missing transport is not permission to split one process into private
+/// catalogues: scripts and file providers still compose with one another.
+pub fn acquire_optional(app: &str, dir: Option<&Path>, pid: u32) -> (Arc<Control>, Option<PathBuf>) {
     let mut guard = SHARED_CONTROLS.lock().unwrap();
     let map = guard.get_or_insert_with(HashMap::new);
     if let Some(entry) = map.get(&(app.to_string(), pid)) {
         return (Arc::clone(&entry.control), entry.socket.clone());
     }
     let control = Arc::new(Control::new(app));
-    let socket = serve(Arc::clone(&control), dir, app, pid);
+    let socket = dir.and_then(|dir| serve(Arc::clone(&control), dir, app, pid));
     map.insert(
         (app.to_string(), pid),
         SharedEntry {
