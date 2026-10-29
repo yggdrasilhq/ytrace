@@ -961,3 +961,17 @@ mod portable_tests {
             .contains("unavailable"));
     }
 }
+
+#[cfg(test)]
+mod missing_transport_tests {
+    use super::*;
+
+    #[test]
+    fn shared_engine_survives_missing_transport_directory() {
+        let (first, socket) = acquire_optional("no-directory-fixture", None, std::process::id());
+        let (joined, joined_socket) = acquire_optional("no-directory-fixture", None, std::process::id());
+        assert!(Arc::ptr_eq(&first, &joined));
+        assert!(socket.is_none());
+        assert!(joined_socket.is_none());
+    }
+}
