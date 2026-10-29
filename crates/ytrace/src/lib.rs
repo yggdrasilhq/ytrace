@@ -171,7 +171,10 @@ fn prune_generations(path: &Path, retention: Retention, now_ms: u128) {
     let mut gens: Vec<(PathBuf, u128, u64)> = Vec::new();
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        if let Some(rest) = name.strip_prefix(&prefix).and_then(|r| r.strip_suffix(".jsonl")) {
+        if let Some(rest) = name
+            .strip_prefix(&prefix)
+            .and_then(|r| r.strip_suffix(".jsonl"))
+        {
             if let Ok(ts) = rest.parse::<u128>() {
                 if let Ok(meta) = e.metadata() {
                     gens.push((e.path(), ts, meta.len()));
@@ -192,7 +195,10 @@ fn prune_generations(path: &Path, retention: Retention, now_ms: u128) {
     let mut gens: Vec<(PathBuf, u128, u64)> = Vec::new();
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        if let Some(rest) = name.strip_prefix(&prefix).and_then(|r| r.strip_suffix(".jsonl")) {
+        if let Some(rest) = name
+            .strip_prefix(&prefix)
+            .and_then(|r| r.strip_suffix(".jsonl"))
+        {
             if let Ok(ts) = rest.parse::<u128>() {
                 if let Ok(meta) = e.metadata() {
                     gens.push((e.path(), ts, meta.len()));
@@ -333,8 +339,7 @@ impl Provider {
         // union) before the names move into the probe map. The registry
         // heartbeat publishes this union, so the (app,pid) row stops
         // flip-flopping between partial catalogues.
-        self.control
-            .advertise(&[format!("{}/{}", category, name)]);
+        self.control.advertise(&[format!("{}/{}", category, name)]);
         let mut map = self.probes.lock().unwrap();
         map.insert(
             (category.clone(), name.clone()),
@@ -446,7 +451,13 @@ impl Provider {
         self.append(&rec);
     }
 
-    pub fn span(&self, component: impl Into<String>, category: impl Into<String>, name: impl Into<String>, ctx: Value) -> SpanGuard<'_> {
+    pub fn span(
+        &self,
+        component: impl Into<String>,
+        category: impl Into<String>,
+        name: impl Into<String>,
+        ctx: Value,
+    ) -> SpanGuard<'_> {
         SpanGuard::start(self, component.into(), category.into(), name.into(), ctx)
     }
 
@@ -503,27 +514,36 @@ impl Provider {
     /// detect by (dev, ino) identity and reopen the live path, so records keep
     /// landing where readers look.
     fn rotation_check(&self, file: &mut Option<File>, incoming: u64) {
-        use std::os::unix::fs::MetadataExt;
         let path = self.home.join("ytrace.jsonl");
-        let ours_id = file
-            .as_ref()
-            .and_then(|f| f.metadata().ok())
-            .map(|m| (m.dev(), m.ino()));
-        let live = fs::metadata(&path).ok();
-        let live_id = live.as_ref().map(|m| (m.dev(), m.ino()));
-        match (&ours_id, &live_id) {
-            (Some(a), Some(b)) if a != b => {
-                // rotated elsewhere — adopt the live file
-                *file = OpenOptions::new().create(true).append(true).open(&path).ok();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let ours_id = file
+                .as_ref()
+                .and_then(|f| f.metadata().ok())
+                .map(|m| (m.dev(), m.ino()));
+            let live_id = fs::metadata(&path).ok().map(|m| (m.dev(), m.ino()));
+            if ours_id.is_some() && ours_id != live_id {
+                *file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .ok();
                 return;
             }
-            (Some(_), None) => {
-                // live file vanished (manual prune) — recreate by reopening
-                *file = OpenOptions::new().create(true).append(true).open(&path).ok();
-                return;
-            }
-            _ => {}
         }
+        // No portable stable file identity is exposed by std::fs on Windows.
+        // Reopen at the existing coarse rotation-check interval so a handle
+        // held across another writer's rotation rejoins the live file.
+        #[cfg(not(unix))]
+        {
+            *file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .ok();
+        }
+        let live = fs::metadata(&path).ok();
         let size = live.map(|m| m.len()).unwrap_or(0);
         if size.saturating_add(incoming) > self.retention.live_max_bytes {
             let ts = now_ms();
@@ -845,13 +865,13 @@ impl<'a> Drop for SpanGuard<'a> {
 
 // ── submodules ──────────────────────────────────────────────────────────────
 
+pub mod compat;
+pub mod control;
+pub mod diagnosis;
+pub mod query;
 pub mod registry;
 pub mod retention_compat;
-pub mod query;
-pub mod compat;
-pub mod diagnosis;
 pub mod script;
-pub mod control;
 
 #[cfg(test)]
 mod tests {
@@ -892,8 +912,16 @@ mod tests {
 
         // the catalogue is the UNION — what the registry now advertises
         let cat = p_perf.control().catalogue();
-        for expected in ["trace/gui", "daemon_request/snapshot", "governor/fault", "host/panic"] {
-            assert!(cat.iter().any(|p| p == expected), "{expected} missing from {cat:?}");
+        for expected in [
+            "trace/gui",
+            "daemon_request/snapshot",
+            "governor/fault",
+            "host/panic",
+        ] {
+            assert!(
+                cat.iter().any(|p| p == expected),
+                "{expected} missing from {cat:?}"
+            );
         }
 
         // a script for the perf provider's probe, attached through the SHARED

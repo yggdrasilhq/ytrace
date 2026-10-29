@@ -19,6 +19,7 @@ use crate::script::{parse, RecRef, ScriptState};
 use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -204,7 +205,9 @@ impl Control {
                 let snap = st.lock().unwrap().drain();
                 json!({"ok": true, "snapshot": snap, "v": PROTOCOL_V})
             }
-            None => json!({"ok": false, "error": format!("no such script `{id}`"), "v": PROTOCOL_V}),
+            None => {
+                json!({"ok": false, "error": format!("no such script `{id}`"), "v": PROTOCOL_V})
+            }
         }
     }
 
@@ -218,7 +221,9 @@ impl Control {
                 st.reset();
                 json!({"ok": true, "snapshot": snap, "v": PROTOCOL_V})
             }
-            None => json!({"ok": false, "error": format!("no such script `{id}`"), "v": PROTOCOL_V}),
+            None => {
+                json!({"ok": false, "error": format!("no such script `{id}`"), "v": PROTOCOL_V})
+            }
         }
     }
 }
@@ -257,6 +262,7 @@ pub fn prune_dead_sockets(dir: &Path, keep: &Path) {
 }
 
 /// The mechanism, with the grace window explicit for tests.
+#[cfg(unix)]
 pub fn prune_dead_sockets_in(dir: &Path, keep: &Path, grace_ms: u128) {
     let now = now_ms_fallback();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -285,6 +291,24 @@ pub fn prune_dead_sockets_in(dir: &Path, keep: &Path, grace_ms: u128) {
     }
 }
 
+// File providers remain available without a Unix socket transport. Never
+// prune or advertise a socket on a platform where we cannot probe its owner.
+#[cfg(not(unix))]
+pub fn prune_dead_sockets_in(_dir: &Path, _keep: &Path, _grace_ms: u128) {}
+
+#[cfg(not(unix))]
+pub fn serve(_control: Arc<Control>, _dir: &Path, _app: &str, _pid: u32) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(not(unix))]
+pub fn request(_sock: &Path, _req: &Value) -> Result<Value, String> {
+    Err(
+        "live ytrace socket control is unavailable on this platform; file records remain available"
+            .into(),
+    )
+}
+
 fn now_ms_fallback() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -301,6 +325,7 @@ fn now_ms_fallback() -> u128 {
 /// `remove_file` below is only safe because `acquire` guarantees at most ONE
 /// `serve` per (app, pid) per process, so the only thing it can unlink is a
 /// genuinely dead socket.
+#[cfg(unix)]
 pub fn serve(control: Arc<Control>, dir: &Path, app: &str, pid: u32) -> Option<PathBuf> {
     prune_dead_sockets(dir, &socket_path(dir, app, pid));
     let path = socket_path(dir, app, pid);
@@ -396,7 +421,9 @@ pub fn canary(
     let mut report = CanaryReport {
         gen,
         digest: pong.get("digest").and_then(|v| v.as_u64()),
-        probes_n: pong.get("probes_n").and_then(|v| v.as_u64().map(|n| n as usize)),
+        probes_n: pong
+            .get("probes_n")
+            .and_then(|v| v.as_u64().map(|n| n as usize)),
         catalogue_checked: false,
     };
     if let Ok(cat) = request(sock, &json!({"verb": "catalogue"})) {
@@ -427,6 +454,7 @@ pub fn canary(
     Ok(report)
 }
 
+#[cfg(unix)]
 fn handle_conn(stream: UnixStream, control: Arc<Control>) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let (reader, mut writer) = (stream.try_clone().expect("clone"), stream);
@@ -480,7 +508,9 @@ fn route(control: &Control, req: &Value) -> Value {
                     }
                     Err(e) => json!({"ok": false, "error": e, "v": PROTOCOL_V}),
                 },
-                None => json!({"ok": false, "error": "attach needs `script` (and optionally `id`)", "v": PROTOCOL_V}),
+                None => {
+                    json!({"ok": false, "error": "attach needs `script` (and optionally `id`)", "v": PROTOCOL_V})
+                }
             }
         }
         Some("detach") => match req.get("id").and_then(|v| v.as_str()) {
@@ -497,12 +527,15 @@ fn route(control: &Control, req: &Value) -> Value {
                 control.drain(id)
             }
         }
-        Some(other) => json!({"ok": false, "error": format!("unknown verb `{other}` (verbs: ping catalogue attach detach scripts drain)"), "v": PROTOCOL_V}),
+        Some(other) => {
+            json!({"ok": false, "error": format!("unknown verb `{other}` (verbs: ping catalogue attach detach scripts drain)"), "v": PROTOCOL_V})
+        }
         None => json!({"ok": false, "error": "request needs a `verb`", "v": PROTOCOL_V}),
     }
 }
 
 /// One request → one response, from a client (the CLI, tests, a notebook).
+#[cfg(unix)]
 pub fn request(sock: &Path, req: &Value) -> Result<Value, String> {
     let mut stream =
         UnixStream::connect(sock).map_err(|e| format!("connect {}: {e}", sock.display()))?;
@@ -511,14 +544,16 @@ pub fn request(sock: &Path, req: &Value) -> Result<Value, String> {
         .map_err(|e| e.to_string())?;
     let mut line = serde_json::to_string(req).map_err(|e| e.to_string())?;
     line.push('\n');
-    stream.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+    stream
+        .write_all(line.as_bytes())
+        .map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(stream);
     let mut resp = String::new();
     reader.read_line(&mut resp).map_err(|e| e.to_string())?;
     serde_json::from_str(&resp).map_err(|e| format!("bad response: {e}"))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use serde_json::json;
@@ -561,9 +596,13 @@ mod tests {
         assert_eq!(d["snapshot"]["stats"]["matched"], 2);
 
         // idempotent re-attach resets aggregates
-        c.attach(Some("slow".into()), "render/gui -> @count").unwrap();
+        c.attach(Some("slow".into()), "render/gui -> @count")
+            .unwrap();
         let d = c.drain("slow");
-        assert_eq!(d["snapshot"]["stats"]["fired"], 0, "re-attach = fresh aggregates");
+        assert_eq!(
+            d["snapshot"]["stats"]["fired"], 0,
+            "re-attach = fresh aggregates"
+        );
 
         assert_eq!(c.detach("slow")["existed"], true);
         assert_eq!(c.detach("slow")["existed"], false);
@@ -573,13 +612,17 @@ mod tests {
     #[test]
     fn drain_reset_is_a_rate_view() {
         let c = Control::new("t");
-        c.attach(Some("all".into()), "render/gui -> @count").unwrap();
+        c.attach(Some("all".into()), "render/gui -> @count")
+            .unwrap();
         let (r, payload) = rec();
         c.eval("render", "gui", &r, &payload);
         let a = c.drain_reset("all");
         assert_eq!(a["snapshot"]["stats"]["matched"], 1);
         let b = c.drain("all");
-        assert_eq!(b["snapshot"]["stats"]["matched"], 0, "reset drained the counters");
+        assert_eq!(
+            b["snapshot"]["stats"]["matched"], 0,
+            "reset drained the counters"
+        );
         c.eval("render", "gui", &r, &payload);
         let d = c.drain_reset("all");
         assert_eq!(d["snapshot"]["stats"]["matched"], 1);
@@ -610,7 +653,10 @@ mod tests {
 
         assert!(live.exists(), "the live socket survives pruning");
         assert!(!dead_path.exists(), "the dead socket file is reaped");
-        assert!(!fresh_path.exists(), "grace 0 reaps everything dead, fresh included");
+        assert!(
+            !fresh_path.exists(),
+            "grace 0 reaps everything dead, fresh included"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -625,7 +671,10 @@ mod tests {
         }
         // huge grace: nothing dies, the starting process is never raced
         prune_dead_sockets_in(&dir, &dir.join("self.sock"), u128::MAX);
-        assert!(dead_path.exists(), "a fresh dead file inside the grace window survives");
+        assert!(
+            dead_path.exists(),
+            "a fresh dead file inside the grace window survives"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -694,7 +743,10 @@ mod tests {
             "both providers must share ONE engine, not two"
         );
         assert_eq!(s1, s2, "the socket path must not be rebound by the joiner");
-        assert!(s1.as_ref().is_some_and(|p| p.exists()), "the socket stays live");
+        assert!(
+            s1.as_ref().is_some_and(|p| p.exists()),
+            "the socket stays live"
+        );
 
         // A script attached through the first engine sees events from the
         // second provider — one control plane, composable providers.
@@ -735,7 +787,10 @@ mod tests {
 
         let pong = request(&path, &json!({"verb": "ping"})).unwrap();
         assert_eq!(pong["ok"], true);
-        assert!(pong["gen"].as_u64().is_some_and(|g| g != 0), "gen is minted");
+        assert!(
+            pong["gen"].as_u64().is_some_and(|g| g != 0),
+            "gen is minted"
+        );
         assert_eq!(pong["probes_n"], 2, "the catalogue is the union");
 
         let cat = request(&path, &json!({"verb": "catalogue"})).unwrap();
@@ -815,15 +870,26 @@ mod tests {
         let control = Arc::new(Control::new("emitcat-app"));
         let path = serve(Arc::clone(&control), &dir, "emitcat-app", 777_006).expect("binds");
 
-        let err = canary(&path, None, Some(("daemon_request", "terminal_app_declares")))
-            .expect_err("before any emission the probe is unobserved");
-        assert!(err.contains("not in the live provider's catalogue"), "{err}");
+        let err = canary(
+            &path,
+            None,
+            Some(("daemon_request", "terminal_app_declares")),
+        )
+        .expect_err("before any emission the probe is unobserved");
+        assert!(
+            err.contains("not in the live provider's catalogue"),
+            "{err}"
+        );
 
         // the emit path records the probe (control::note_emitted — the
         // Provider calls this in scripts_eval before any gate)
         control.note_emitted("daemon_request", "terminal_app_declares");
-        let ok = canary(&path, None, Some(("daemon_request", "terminal_app_declares")))
-            .expect("an emitted probe is attachable, registered or not");
+        let ok = canary(
+            &path,
+            None,
+            Some(("daemon_request", "terminal_app_declares")),
+        )
+        .expect("an emitted probe is attachable, registered or not");
         assert!(ok.catalogue_checked);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -864,5 +930,23 @@ mod tests {
         assert_eq!(report.gen, None);
         server.join().ok();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+mod portable_tests {
+    use super::*;
+
+    #[test]
+    fn file_provider_never_advertises_unavailable_socket() {
+        let dir = std::env::temp_dir().join("ytrace-portable-control");
+        let (first, socket) = acquire("portable-control", &dir, std::process::id());
+        let (joined, joined_socket) = acquire("portable-control", &dir, std::process::id());
+        assert!(Arc::ptr_eq(&first, &joined));
+        assert!(socket.is_none());
+        assert!(joined_socket.is_none());
+        assert!(request(&dir.join("missing.sock"), &json!({"verb":"ping"}))
+            .unwrap_err()
+            .contains("unavailable"));
     }
 }
