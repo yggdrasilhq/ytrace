@@ -171,7 +171,10 @@ fn prune_generations(path: &Path, retention: Retention, now_ms: u128) {
     let mut gens: Vec<(PathBuf, u128, u64)> = Vec::new();
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        if let Some(rest) = name.strip_prefix(&prefix).and_then(|r| r.strip_suffix(".jsonl")) {
+        if let Some(rest) = name
+            .strip_prefix(&prefix)
+            .and_then(|r| r.strip_suffix(".jsonl"))
+        {
             if let Ok(ts) = rest.parse::<u128>() {
                 if let Ok(meta) = e.metadata() {
                     gens.push((e.path(), ts, meta.len()));
@@ -192,7 +195,10 @@ fn prune_generations(path: &Path, retention: Retention, now_ms: u128) {
     let mut gens: Vec<(PathBuf, u128, u64)> = Vec::new();
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        if let Some(rest) = name.strip_prefix(&prefix).and_then(|r| r.strip_suffix(".jsonl")) {
+        if let Some(rest) = name
+            .strip_prefix(&prefix)
+            .and_then(|r| r.strip_suffix(".jsonl"))
+        {
             if let Ok(ts) = rest.parse::<u128>() {
                 if let Ok(meta) = e.metadata() {
                     gens.push((e.path(), ts, meta.len()));
@@ -287,9 +293,9 @@ impl Provider {
         // unlinked the previous live listener — its attached scripts became
         // unreachable and the registry's single (app,pid) row flipped its
         // catalogue to the last rebinder. `acquire` joins the first engine.
-        let (control, socket) = control::control_dir()
-            .map(|dir| control::acquire(&app, &dir, std::process::id()))
-            .unwrap_or_else(|| (Arc::new(control::Control::new(&app)), None));
+        let directory = control::control_dir();
+        let (control, socket) = control::acquire_optional(
+            &app, directory.as_deref(), std::process::id());
         Self {
             app,
             app_version: app_version.into(),
@@ -333,8 +339,7 @@ impl Provider {
         // union) before the names move into the probe map. The registry
         // heartbeat publishes this union, so the (app,pid) row stops
         // flip-flopping between partial catalogues.
-        self.control
-            .advertise(&[format!("{}/{}", category, name)]);
+        self.control.advertise(&[format!("{}/{}", category, name)]);
         let mut map = self.probes.lock().unwrap();
         map.insert(
             (category.clone(), name.clone()),
@@ -446,7 +451,13 @@ impl Provider {
         self.append(&rec);
     }
 
-    pub fn span(&self, component: impl Into<String>, category: impl Into<String>, name: impl Into<String>, ctx: Value) -> SpanGuard<'_> {
+    pub fn span(
+        &self,
+        component: impl Into<String>,
+        category: impl Into<String>,
+        name: impl Into<String>,
+        ctx: Value,
+    ) -> SpanGuard<'_> {
         SpanGuard::start(self, component.into(), category.into(), name.into(), ctx)
     }
 
@@ -503,27 +514,36 @@ impl Provider {
     /// detect by (dev, ino) identity and reopen the live path, so records keep
     /// landing where readers look.
     fn rotation_check(&self, file: &mut Option<File>, incoming: u64) {
-        use std::os::unix::fs::MetadataExt;
         let path = self.home.join("ytrace.jsonl");
-        let ours_id = file
-            .as_ref()
-            .and_then(|f| f.metadata().ok())
-            .map(|m| (m.dev(), m.ino()));
-        let live = fs::metadata(&path).ok();
-        let live_id = live.as_ref().map(|m| (m.dev(), m.ino()));
-        match (&ours_id, &live_id) {
-            (Some(a), Some(b)) if a != b => {
-                // rotated elsewhere — adopt the live file
-                *file = OpenOptions::new().create(true).append(true).open(&path).ok();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let ours_id = file
+                .as_ref()
+                .and_then(|f| f.metadata().ok())
+                .map(|m| (m.dev(), m.ino()));
+            let live_id = fs::metadata(&path).ok().map(|m| (m.dev(), m.ino()));
+            if ours_id.is_some() && ours_id != live_id {
+                *file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .ok();
                 return;
             }
-            (Some(_), None) => {
-                // live file vanished (manual prune) — recreate by reopening
-                *file = OpenOptions::new().create(true).append(true).open(&path).ok();
-                return;
-            }
-            _ => {}
         }
+        // No portable stable file identity is exposed by std::fs on Windows.
+        // Reopen at the existing coarse rotation-check interval so a handle
+        // held across another writer's rotation rejoins the live file.
+        #[cfg(not(unix))]
+        {
+            *file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .ok();
+        }
+        let live = fs::metadata(&path).ok();
         let size = live.map(|m| m.len()).unwrap_or(0);
         if size.saturating_add(incoming) > self.retention.live_max_bytes {
             let ts = now_ms();
@@ -697,6 +717,10 @@ fn default_home(app: &str) -> PathBuf {
             .join("ytrace")
             .join(app);
     }
+    #[cfg(windows)]
+    if let Some(base) = dirs::data_local_dir() {
+        return base.join("ytrace").join(app);
+    }
     PathBuf::from("/tmp/ytrace").join(app)
 }
 
@@ -845,13 +869,13 @@ impl<'a> Drop for SpanGuard<'a> {
 
 // ── submodules ──────────────────────────────────────────────────────────────
 
+pub mod compat;
+pub mod control;
+pub mod diagnosis;
+pub mod query;
 pub mod registry;
 pub mod retention_compat;
-pub mod query;
-pub mod compat;
-pub mod diagnosis;
 pub mod script;
-pub mod control;
 
 #[cfg(test)]
 mod tests {
@@ -862,6 +886,28 @@ mod tests {
         assert_eq!(DEFAULT_LIVE_MAX_BYTES, 100 * 1024 * 1024);
         assert_eq!(DEFAULT_RETENTION.live_max_bytes, DEFAULT_LIVE_MAX_BYTES);
         assert_eq!(default_retention().live_max_bytes, DEFAULT_LIVE_MAX_BYTES);
+    }
+
+    #[test]
+    fn provider_rejoins_live_file_after_external_rotation() {
+        let temp = tempfile::tempdir().unwrap();
+        let provider = Provider::with_home("portable-rotation", "test", temp.path());
+        provider.event("test", "rotation", "before", serde_json::json!({}));
+        let path = temp.path().join("ytrace.jsonl");
+        let rotated = temp.path().join("rotated.jsonl");
+        fs::rename(&path, &rotated).unwrap();
+        fs::write(&path, "").unwrap();
+        {
+            let mut out = provider.out.lock().unwrap();
+            provider.rotation_check(&mut out.file, 0);
+        }
+        provider.event("test", "rotation", "after", serde_json::json!({}));
+        let active = fs::read_to_string(&path).unwrap();
+        let previous = fs::read_to_string(&rotated).unwrap();
+        assert!(active.contains("after"));
+        assert!(!active.contains("before"));
+        assert!(previous.contains("before"));
+        assert!(!previous.contains("after"));
     }
 
     /// The audit's end-to-end shape, at the Provider level: four yggterm-style
@@ -884,16 +930,35 @@ mod tests {
         p_gov.register("governor/fault", Clock::Wall, Sample::always());
         p_panic.register("host/panic", Clock::Wall, Sample::always());
 
-        // one socket for all four
-        let sock = p_trace.socket_path().expect("the first provider binds");
-        assert_eq!(p_perf.socket_path(), Some(sock));
-        assert_eq!(p_gov.socket_path(), Some(sock));
-        assert_eq!(p_panic.socket_path(), Some(sock));
+        // Unix advertises one socket; other platforms preserve the shared
+        // engine and file provider without claiming a live socket transport.
+        #[cfg(unix)]
+        {
+            let sock = p_trace.socket_path().expect("the first provider binds");
+            assert_eq!(p_perf.socket_path(), Some(sock));
+            assert_eq!(p_gov.socket_path(), Some(sock));
+            assert_eq!(p_panic.socket_path(), Some(sock));
+        }
+        #[cfg(not(unix))]
+        {
+            assert!(p_trace.socket_path().is_none());
+            assert!(p_perf.socket_path().is_none());
+            assert!(p_gov.socket_path().is_none());
+            assert!(p_panic.socket_path().is_none());
+        }
 
         // the catalogue is the UNION — what the registry now advertises
         let cat = p_perf.control().catalogue();
-        for expected in ["trace/gui", "daemon_request/snapshot", "governor/fault", "host/panic"] {
-            assert!(cat.iter().any(|p| p == expected), "{expected} missing from {cat:?}");
+        for expected in [
+            "trace/gui",
+            "daemon_request/snapshot",
+            "governor/fault",
+            "host/panic",
+        ] {
+            assert!(
+                cat.iter().any(|p| p == expected),
+                "{expected} missing from {cat:?}"
+            );
         }
 
         // a script for the perf provider's probe, attached through the SHARED
